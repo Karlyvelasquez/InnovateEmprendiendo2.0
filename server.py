@@ -7,7 +7,7 @@ import io
 import json
 import os
 import secrets
-import sqlite3
+import pg_compat as sqlite3
 import time
 import unicodedata
 import zipfile
@@ -26,7 +26,7 @@ import xml.etree.ElementTree as ET
 from xml.sax.saxutils import escape as xml_escape
 
 ROOT = Path(__file__).resolve().parent
-DB_PATH = Path(os.environ.get("DB_PATH", str(ROOT / "innovate_pitch.db")))
+DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
 EXCEL_PATH = ROOT / "Programación_I_pitch_con_descripcion.xlsx"
 SESSION_COOKIE = "innovate_pitch_session"
 SESSION_TTL_HOURS = 24 * 7
@@ -126,11 +126,9 @@ def iso_now() -> str:
 
 
 def db_connect() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON")
-    conn.execute("PRAGMA journal_mode = WAL")
-    return conn
+    if not DATABASE_URL:
+        raise RuntimeError("Falta la variable de entorno DATABASE_URL de Neon.")
+    return sqlite3.connect(DATABASE_URL)
 
 
 def pbkdf2_hash(password: str, salt: bytes | None = None) -> str:
@@ -161,17 +159,17 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
     conn.executescript(
         """
         CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id BIGSERIAL PRIMARY KEY,
             name TEXT NOT NULL,
             identifier TEXT NOT NULL UNIQUE,
             password_hash TEXT NOT NULL,
             role TEXT NOT NULL CHECK (role IN ('admin', 'jury')),
             active INTEGER NOT NULL DEFAULT 1,
-            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP::text)
         );
 
         CREATE TABLE IF NOT EXISTS teams (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id BIGSERIAL PRIMARY KEY,
             display_order INTEGER NOT NULL UNIQUE,
             name TEXT NOT NULL,
             description TEXT NOT NULL,
@@ -182,75 +180,71 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
             theme_line TEXT NOT NULL,
             source_row INTEGER,
             manual_position INTEGER,
-            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP::text)
         );
 
         CREATE TABLE IF NOT EXISTS evaluations (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            team_id INTEGER NOT NULL,
-            juror_id INTEGER NOT NULL,
-            problem_score REAL NOT NULL,
-            value_score REAL NOT NULL,
-            validation_score REAL NOT NULL,
-            business_score REAL NOT NULL,
-            pitch_score REAL NOT NULL,
+            id BIGSERIAL PRIMARY KEY,
+            team_id BIGINT NOT NULL,
+            juror_id BIGINT NOT NULL,
+            problem_score DOUBLE PRECISION NOT NULL,
+            value_score DOUBLE PRECISION NOT NULL,
+            validation_score DOUBLE PRECISION NOT NULL,
+            business_score DOUBLE PRECISION NOT NULL,
+            pitch_score DOUBLE PRECISION NOT NULL,
             observations TEXT NOT NULL DEFAULT '',
-            final_score_5 REAL NOT NULL,
-            final_score_100 REAL NOT NULL,
-            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            final_score_5 DOUBLE PRECISION NOT NULL,
+            final_score_100 DOUBLE PRECISION NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP::text),
+            updated_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP::text),
             UNIQUE(team_id, juror_id),
             FOREIGN KEY(team_id) REFERENCES teams(id) ON DELETE CASCADE,
             FOREIGN KEY(juror_id) REFERENCES users(id) ON DELETE CASCADE
         );
 
         CREATE TABLE IF NOT EXISTS ranking_history (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            team_id INTEGER NOT NULL,
-            evaluation_id INTEGER,
+            id BIGSERIAL PRIMARY KEY,
+            team_id BIGINT NOT NULL,
+            evaluation_id BIGINT,
             position INTEGER NOT NULL,
-            score_5 REAL NOT NULL,
-            score_100 REAL NOT NULL,
-            recorded_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            score_5 DOUBLE PRECISION NOT NULL,
+            score_100 DOUBLE PRECISION NOT NULL,
+            recorded_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP::text),
             FOREIGN KEY(team_id) REFERENCES teams(id) ON DELETE CASCADE,
             FOREIGN KEY(evaluation_id) REFERENCES evaluations(id) ON DELETE SET NULL
         );
 
         CREATE TABLE IF NOT EXISTS no_shows (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            team_id INTEGER NOT NULL,
-            juror_id INTEGER NOT NULL,
-            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            id BIGSERIAL PRIMARY KEY,
+            team_id BIGINT NOT NULL,
+            juror_id BIGINT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP::text),
             UNIQUE(team_id, juror_id),
             FOREIGN KEY(team_id) REFERENCES teams(id) ON DELETE CASCADE,
             FOREIGN KEY(juror_id) REFERENCES users(id) ON DELETE CASCADE
         );
 
         CREATE TABLE IF NOT EXISTS ai_improvements (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            team_id INTEGER NOT NULL,
-            juror_id INTEGER NOT NULL,
-            used_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            id BIGSERIAL PRIMARY KEY,
+            team_id BIGINT NOT NULL,
+            juror_id BIGINT NOT NULL,
+            used_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP::text),
             UNIQUE(team_id, juror_id),
             FOREIGN KEY(team_id) REFERENCES teams(id) ON DELETE CASCADE,
             FOREIGN KEY(juror_id) REFERENCES users(id) ON DELETE CASCADE
         );
 
         CREATE TABLE IF NOT EXISTS sessions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id BIGSERIAL PRIMARY KEY,
             token TEXT NOT NULL UNIQUE,
-            user_id INTEGER NOT NULL,
+            user_id BIGINT NOT NULL,
             expires_at TEXT NOT NULL,
-            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            last_seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP::text),
+            last_seen_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP::text),
             FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
         );
         """
     )
-    # Migration for databases created before manual_position existed.
-    existing_columns = {row["name"] for row in conn.execute("PRAGMA table_info(teams)").fetchall()}
-    if "manual_position" not in existing_columns:
-        conn.execute("ALTER TABLE teams ADD COLUMN manual_position INTEGER")
 
 
 def seed_users(conn: sqlite3.Connection) -> None:
@@ -503,12 +497,16 @@ def seed_initial_history(conn: sqlite3.Connection) -> None:
 
 
 def initialize_database() -> None:
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    # Neon is persistent, so initialization must be idempotent and must never
+    # delete existing production data on a cold start.
     with db_connect() as conn:
         ensure_schema(conn)
-        seed_users(conn)
-        seed_teams(conn)
-        seed_initial_history(conn)
+        if conn.execute("SELECT COUNT(*) FROM users").fetchone()[0] == 0:
+            seed_users(conn)
+        if conn.execute("SELECT COUNT(*) FROM teams").fetchone()[0] == 0:
+            seed_teams(conn)
+        if conn.execute("SELECT COUNT(*) FROM ranking_history").fetchone()[0] == 0:
+            seed_initial_history(conn)
         conn.commit()
 
 
@@ -1810,19 +1808,20 @@ def load_dotenv_if_present(path: str = ".env") -> None:
 def main() -> None:
     load_dotenv_if_present()
     initialize_database()
-    port = int(os.environ.get("PORT", 8000))
-    # Locally we only bind to loopback for safety. In the cloud (Railway sets
-    # PORT), we need to listen on all interfaces so the platform can reach us.
-    host = "0.0.0.0" if "PORT" in os.environ else "127.0.0.1"
+
+    host = os.environ.get("HOST", "127.0.0.1")
+    port = int(os.environ.get("PORT", "8000"))
+
     server = ThreadingHTTPServer((host, port), InnovatePitchHandler)
-    print(f"Innovate Pitch server running on {host}:{port}")
+    print(f"Innovate Pitch server running at http://{host}:{port}")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        pass
+        print("\nServidor detenido.")
     finally:
         server.server_close()
 
 
 if __name__ == "__main__":
     main()
+

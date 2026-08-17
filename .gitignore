@@ -1,16 +1,17 @@
-# Credenciales y configuración sensible - NUNCA subir esto
-users_seed.json
+# Secrets / local data
 .env
-
-# Base de datos local (contiene evaluaciones, observaciones, etc.)
-innovate_pitch.db
-innovate_pitch.db-shm
-innovate_pitch.db-wal
+.env.*
+!.env.example
+*.db
+*.db-shm
+*.db-wal
+users_seed.json
 
 # Python
 __pycache__/
-*.pyc
+*.py[cod]
+.venv/
+venv/
 
-# Sistema
-.DS_Store
-Thumbs.db
+# Vercel
+.vercel/
