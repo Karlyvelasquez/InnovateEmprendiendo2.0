@@ -1110,3 +1110,219 @@ select:focus {
     width: 100%;
   }
 }
+/* =========================================================
+   RESPONSIVE ADMIN DASHBOARD
+   No modifica el responsive del perfil de jurado
+   ========================================================= */
+
+/* Evita que elementos internos provoquen overflow */
+.dashboard-grid,
+.dashboard-grid > *,
+.split-grid,
+.split-grid > *,
+.card,
+.detail-header,
+.summary-grid,
+.summary-card,
+.table-wrap {
+  min-width: 0;
+}
+
+/* El contenido de las tarjetas puede encogerse correctamente */
+.card,
+.summary-card {
+  overflow: hidden;
+}
+
+/* ---------------------------------------------------------
+   TABLET
+   --------------------------------------------------------- */
+@media (max-width: 1080px) {
+
+  /* Indicadores del administrador: 2 x 2 */
+  .summary-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  /* Los bloques principales del admin ocupan todo el ancho */
+  .split-grid {
+    grid-template-columns: 1fr;
+  }
+
+  /* Evita que títulos y acciones se empujen entre sí */
+  .detail-header {
+    flex-wrap: wrap;
+  }
+
+  .detail-header > * {
+    min-width: 0;
+  }
+
+  /* Las tablas conservan su estructura pero permiten
+     desplazamiento horizontal */
+  .table-wrap {
+    width: 100%;
+    max-width: 100%;
+    overflow-x: auto;
+    overflow-y: hidden;
+    -webkit-overflow-scrolling: touch;
+  }
+
+  .table-wrap table {
+    min-width: 680px;
+  }
+
+  /* Textos largos no rompen la tarjeta */
+  .card h1,
+  .card h2,
+  .card h3,
+  .card p,
+  .summary-card {
+    overflow-wrap: anywhere;
+  }
+}
+
+
+/* ---------------------------------------------------------
+   MÓVIL
+   --------------------------------------------------------- */
+@media (max-width: 760px) {
+
+  /* El contenedor principal aprovecha mejor el móvil */
+  .shell {
+    width: min(100% - 18px, 1380px);
+  }
+
+  /* Indicadores: una tarjeta por fila */
+  .summary-grid {
+    grid-template-columns: 1fr;
+    gap: 10px;
+  }
+
+  /* Tarjetas del dashboard */
+  .dashboard-grid,
+  .split-grid {
+    grid-template-columns: 1fr;
+    width: 100%;
+  }
+
+  /* Evita que una tarjeta sea más ancha que la pantalla */
+  .dashboard-grid > *,
+  .split-grid > * {
+    width: 100%;
+    max-width: 100%;
+    min-width: 0;
+  }
+
+  /* Encabezados */
+  .detail-header {
+    display: flex;
+    flex-direction: column;
+    align-items: stretch;
+    gap: 10px;
+  }
+
+  .detail-header .badge {
+    align-self: flex-start;
+  }
+
+  /* Botones y grupos de acciones */
+  .detail-header .actions,
+  .toolbar,
+  .navigation-actions {
+    width: 100%;
+    max-width: 100%;
+  }
+
+  .toolbar {
+    flex-wrap: wrap;
+  }
+
+  .toolbar > * {
+    min-width: 0;
+    max-width: 100%;
+  }
+
+  /* Botones en móvil */
+  .toolbar .button,
+  .navigation-actions .button {
+    flex: 1 1 auto;
+    min-width: 0;
+  }
+
+  /* Ranking */
+  .table-wrap {
+    width: 100%;
+    max-width: 100%;
+    overflow-x: auto;
+    overflow-y: hidden;
+    -webkit-overflow-scrolling: touch;
+    border-radius: 12px;
+  }
+
+  .table-wrap table {
+    min-width: 680px;
+  }
+
+  /* Evita que textos largos dañen el layout */
+  .card h1,
+  .card h2,
+  .card h3,
+  .card h4,
+  .card p,
+  .summary-card,
+  .badge {
+    overflow-wrap: anywhere;
+    word-break: normal;
+  }
+
+  /* Los modales aprovechan el ancho disponible */
+  .modal__panel {
+    width: calc(100vw - 24px);
+    max-width: calc(100vw - 24px);
+  }
+}
+
+
+/* ---------------------------------------------------------
+   MÓVILES MUY PEQUEÑOS
+   --------------------------------------------------------- */
+@media (max-width: 480px) {
+
+  .shell {
+    width: calc(100% - 12px);
+  }
+
+  .card {
+    border-radius: 14px;
+  }
+
+  /* Acciones apiladas */
+  .navigation-actions {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+
+  .navigation-actions .button {
+    width: 100%;
+  }
+
+  /* Toolbar vertical */
+  .toolbar {
+    display: flex;
+    flex-direction: column;
+    align-items: stretch;
+    gap: 8px;
+  }
+
+  .toolbar > *,
+  .toolbar .button {
+    width: 100%;
+  }
+
+  /* Evita que badges o etiquetas desborden */
+  .badge {
+    max-width: 100%;
+  }
+}
