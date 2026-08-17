@@ -1,5 +1,4 @@
 innovate_pitch.db
-server.py
 __pycache__/
 *.pyc
 .env
