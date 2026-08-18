@@ -691,7 +691,7 @@ def get_juror_no_show_ids(conn: sqlite3.Connection, juror_id: int) -> set[int]:
     return {row["team_id"] for row in rows}
 
 
-GEMINI_MODEL = "gemini-flash-latest"
+GEMINI_MODEL = "gemini-2.5-flash"
 GEMINI_API_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
 GEMINI_SYSTEM_INSTRUCTION = (
     "Eres un asistente de edición para jurados de proyectos. Tu única tarea es corregir la "
