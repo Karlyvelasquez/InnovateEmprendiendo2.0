@@ -92,7 +92,7 @@ RUBRICS = [
         "key": "value_score",
         "label": "Propuesta de valor",
         "weight": 0.25,
-        "description": "Evalúa qué tan innovadora, diferenciadora y pertinente es la solución planteada para responder al problema identificado, así como el valor que aporta a los usuarios.",
+        "description": "Evalúa qué tan innovadora, diferenciadora y pertinente es la solución planteada para responder al problema identificado, el valor que aporta a los usuarios y su alineación con las megatendencias.",
     },
     {
         "key": "validation_score",
