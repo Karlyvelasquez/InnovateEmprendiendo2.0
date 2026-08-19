@@ -15,3 +15,7 @@ venv/
 
 # Vercel
 .vercel/
+*.sqlite
+*.sqlite3
+.vscode/
+.DS_Store

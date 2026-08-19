@@ -85,6 +85,20 @@ function getUniversityLabel(team) {
   return team.filial ? `${team.university} · ${team.filial}` : team.university;
 }
 
+// Etiqueta sutil de "día" (19 o 20 de agosto). Es solo informativa: no
+// cambia el orden del ranking, que sigue siendo una única competencia.
+const DAY_BADGE_STYLES = {
+  '19 de agosto': { label: '19 ago', bg: '#eef2ff', fg: '#4338ca', border: '#c7d2fe' },
+  '20 de agosto': { label: '20 ago', bg: '#fff7ed', fg: '#c2410c', border: '#fed7aa' },
+};
+
+function dayBadge(team) {
+  const day = team?.schedule_day;
+  const style = DAY_BADGE_STYLES[day];
+  if (!style) return '';
+  return `<span class="day-chip" title="Presentó el ${escapeHtml(day)} · no afecta el ranking" style="display:inline-block;margin-left:6px;padding:1px 8px;border-radius:999px;font-size:11px;font-weight:600;letter-spacing:.02em;background:${style.bg};color:${style.fg};border:1px solid ${style.border};white-space:nowrap;vertical-align:middle;">${style.label}</span>`;
+}
+
 function getStatusClass(status) {
   return `status-pill`;
 }
@@ -92,6 +106,13 @@ function getStatusClass(status) {
 function setScreen(authenticated) {
   dom.authScreen.classList.toggle('active', !authenticated);
   dom.appScreen.classList.toggle('active', authenticated);
+}
+
+function scrollDashboardToTop() {
+  if (dom.dashboardRoot && typeof dom.dashboardRoot.scrollIntoView === 'function') {
+    dom.dashboardRoot.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }
+  window.scrollTo({ top: 0, behavior: 'smooth' });
 }
 
 function setToast(message, type = 'info') {
@@ -412,7 +433,7 @@ function renderAdminDashboard() {
         <tr class="${team.id === selectedTeam?.id ? 'active' : ''} ${(team.position || 0) <= WINNER_CUTOFF ? 'qualifies' : ''}" data-action="select-admin-team" data-team-id="${team.id}">
           <td><strong>#${team.position || '—'}</strong></td>
           <td>
-            <div><strong>${escapeHtml(team.name)}</strong></div>
+            <div><strong>${escapeHtml(team.name)}</strong>${dayBadge(team)}</div>
             <div class="muted">${escapeHtml(getUniversityLabel(team))}</div>
           </td>
           <td>${formatNumber(team.average_5, 2)}</td>
@@ -434,7 +455,7 @@ function renderAdminDashboard() {
             <span class="deliberation-card__handle" title="Arrastra para reordenar">⠿⠿</span>
             <span class="deliberation-card__rank">#${index + 1}</span>
             <div class="deliberation-card__info">
-              <strong>${escapeHtml(team.name)}</strong>
+              <strong>${escapeHtml(team.name)}${dayBadge(team)}</strong>
               <span class="muted">${formatNumber(team.average_5, 2)} / 5 · ${team.evaluation_count} evaluaciones</span>
             </div>
             <div class="deliberation-card__controls">
@@ -542,7 +563,8 @@ function renderAdminDashboard() {
       `;
 
   const winnersLegend = !state.deliberating
-    ? `<div class="inline-feedback" style="margin-top:10px;"><span class="qualifies-swatch"></span> Los primeros ${WINNER_CUTOFF} lugares (resaltados) son los que clasifican.</div>`
+    ? `<div class="inline-feedback" style="margin-top:10px;"><span class="qualifies-swatch"></span> Los primeros ${WINNER_CUTOFF} lugares (resaltados) son los que clasifican.</div>
+       <div class="inline-feedback" style="margin-top:6px;">${dayBadge({ schedule_day: '19 de agosto' })} ${dayBadge({ schedule_day: '20 de agosto' })} <span class="muted">indican el día en que presentó cada equipo — es solo informativo, es la misma competencia y no afecta la posición en el ranking.</span></div>`
     : '';
 
   const rankingBody = state.deliberating
@@ -672,7 +694,7 @@ function renderJuryDashboard() {
     ? `
       <article class="team-card">
         <p class="section-label">Equipo actual</p>
-        <h3>${escapeHtml(currentSummary.name)}</h3>
+        <h3>${escapeHtml(currentSummary.name)}${dayBadge(currentSummary)}</h3>
         <p class="muted">${escapeHtml(currentSummary.description)}</p>
         <div class="team-meta-grid">
           <div class="team-info-item"><span>Líder</span><strong>${escapeHtml(currentSummary.leader)}</strong></div>
@@ -738,6 +760,7 @@ function renderJuryDashboard() {
     : 'Lista para avanzar';
 
   const saveDisabled = !isDraftComplete(currentDraft);
+  const rubricAlreadyScored = scoreFields.every((key) => isValidScoreValue(currentDraft?.scores?.[key]));
   const aiUsed = Boolean(dashboard.ai_improvement_used);
   const hasObservationsText = Boolean((currentDraft.observations || '').trim());
   const aiOriginalText = dashboard.current_team_id !== undefined && dashboard.current_team_id !== null
@@ -780,8 +803,9 @@ function renderJuryDashboard() {
       <section class="navigation-card">
         <p class="section-label">Navegación</p>
         <h3>Flujo secuencial</h3>
+        <p class="navigation-card__team">Equipo actual: <strong>${escapeHtml(currentSummary?.name || '—')}</strong></p>
         <div class="navigation-actions">
-          <button class="button button--danger" type="button" data-action="jury-no-show">No asistió</button>
+          <button class="button button--danger" type="button" data-action="jury-no-show" ${rubricAlreadyScored ? 'disabled title="Ya calificaste este equipo, no puedes marcarlo como no asistió."' : ''}>No asistió</button>
           <button class="button button--primary" type="button" data-action="jury-save" ${saveDisabled ? 'disabled' : ''}>Guardar evaluación</button>
         </div>
         <div class="inline-feedback">${state.juryDirty ? 'Tienes cambios sin guardar.' : 'Al guardar avanzas automáticamente al siguiente equipo pendiente. Si el equipo no se presentó, usa "No asistió" para pasarlo al final de la lista.'}</div>
@@ -824,7 +848,7 @@ function renderTeamSearchResults() {
     <button type="button" class="search-item" data-action="choose-team" data-team-id="${team.id}">
       <div class="search-item__top">
         <div>
-          <h4>${escapeHtml(team.name)}</h4>
+          <h4>${escapeHtml(team.name)}${dayBadge(team)}</h4>
           <small>Orden ${team.display_order} · ${escapeHtml(team.status)}</small>
         </div>
         <span class="mini-pill" data-status="${escapeHtml(team.status)}">#${team.position || '—'}</span>
@@ -962,6 +986,7 @@ async function handleSaveEvaluation() {
     state.juryDirty = false;
     state.activeTeamId = response.dashboard.current_team_id;
     render();
+    scrollDashboardToTop();
     setToast(response.message || 'Evaluación guardada correctamente.');
   } catch (error) {
     setToast(error.message, 'error');
@@ -1012,6 +1037,11 @@ function handleAiRevert() {
 
 async function handleJuryNoShow() {
   if (state.role !== 'jury' || !state.dashboard?.current_team_id) return;
+  const rubricAlreadyScored = scoreFields.every((key) => isValidScoreValue(state.juryDraft?.scores?.[key]));
+  if (rubricAlreadyScored) {
+    setToast('Ya calificaste este equipo, no puedes marcarlo como no asistió.', 'error');
+    return;
+  }
   if (!confirmDiscardChanges()) return;
 
   const teamId = state.dashboard.current_team_id;
@@ -1025,6 +1055,7 @@ async function handleJuryNoShow() {
     state.juryDirty = false;
     state.activeTeamId = response.dashboard.current_team_id;
     render();
+    scrollDashboardToTop();
     setToast(response.message || "Equipo marcado como 'No asistió'.");
   } catch (error) {
     setToast(error.message, 'error');

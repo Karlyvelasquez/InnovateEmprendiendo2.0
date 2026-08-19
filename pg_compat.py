@@ -60,8 +60,13 @@ def _translate_sql(sql: str) -> str:
     return sql
 
 class PGConnection:
-    def __init__(self, url: str):
-        self._conn = psycopg.connect(url, row_factory=dict_row)
+    def __init__(self, conn):
+        # `conn` is a raw psycopg connection, owned by the module-level pool
+        # below (`connect()`), not by this wrapper. This wrapper is cheap and
+        # created fresh per-request; the underlying TCP/TLS connection to
+        # Neon is what actually gets reused across requests in a warm
+        # Vercel container.
+        self._conn = conn
 
     def execute(self, sql: str, params: Iterable[Any] | None = None) -> CompatCursor:
         sql = _translate_sql(sql)
@@ -95,17 +100,73 @@ class PGConnection:
         self._conn.rollback()
 
     def close(self):
-        self._conn.close()
+        # Deliberately a no-op: the raw connection is owned by the
+        # module-level pool in `connect()` and is kept open so the *next*
+        # request on this same warm serverless container can reuse it
+        # instead of paying a fresh TCP+TLS+auth handshake to Neon.
+        pass
 
     def __enter__(self):
         return self
 
     def __exit__(self, exc_type, exc, tb):
-        if exc_type is None:
-            self._conn.commit()
-        else:
-            self._conn.rollback()
-        self._conn.close()
+        global _shared_conn
+        try:
+            if exc_type is None:
+                self._conn.commit()
+            else:
+                self._conn.rollback()
+        except Exception:
+            # Connection is in a bad state (e.g. Neon closed it server-side
+            # after being idle). Drop it so the next call reconnects instead
+            # of repeatedly failing on a dead connection.
+            try:
+                self._conn.close()
+            except Exception:
+                pass
+            _shared_conn = None
+            if exc_type is None:
+                raise
+
+
+# One physical connection per warm container, reused across requests.
+# `db_connect()` in server.py calls this once per request; we hand back a
+# thin wrapper around the same underlying psycopg connection whenever it's
+# still alive, instead of reconnecting to Neon from scratch every time.
+_shared_conn: "psycopg.Connection | None" = None
+
 
 def connect(url: str) -> PGConnection:
-    return PGConnection(url)
+    global _shared_conn
+    if _shared_conn is None or _shared_conn.closed:
+        _shared_conn = psycopg.connect(
+            url,
+            row_factory=dict_row,
+            connect_timeout=10,
+            # Keep the TCP connection alive through NAT/proxies between
+            # requests instead of it silently dying while idle.
+            keepalives=1,
+            keepalives_idle=30,
+            keepalives_interval=10,
+            keepalives_count=3,
+        )
+    else:
+        try:
+            # Cheap liveness check — a stale/half-closed connection from a
+            # previous invocation should be replaced, not reused blindly.
+            _shared_conn.execute("SELECT 1")
+        except Exception:
+            try:
+                _shared_conn.close()
+            except Exception:
+                pass
+            _shared_conn = psycopg.connect(
+                url,
+                row_factory=dict_row,
+                connect_timeout=10,
+                keepalives=1,
+                keepalives_idle=30,
+                keepalives_interval=10,
+                keepalives_count=3,
+            )
+    return PGConnection(_shared_conn)

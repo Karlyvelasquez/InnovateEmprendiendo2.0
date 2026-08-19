@@ -27,7 +27,12 @@ from xml.sax.saxutils import escape as xml_escape
 
 ROOT = Path(__file__).resolve().parent
 DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
-EXCEL_PATH = ROOT / "Programación_I_pitch_con_descripcion.xlsx"
+TEAMS_CSV_PATH = ROOT / "teams_schedule.csv"
+# Tamaño de "bloque" reservado para cada día en display_order. Los equipos de
+# un mismo día siempre ocupan un rango contiguo (día 1: 1..N, día 2: N+1..M),
+# lo que permite mover un equipo al final de SU día (por inasistencia) sin
+# tocar el orden de los equipos del otro día.
+SCHEDULE_DAYS_ORDER = ["19 de agosto", "20 de agosto"]
 SESSION_COOKIE = "innovate_pitch_session"
 SESSION_TTL_HOURS = 24 * 7
 PBKDF2_ITERATIONS = 210_000
@@ -180,6 +185,9 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
             theme_line TEXT NOT NULL,
             source_row INTEGER,
             manual_position INTEGER,
+            schedule_day TEXT,
+            schedule_time TEXT,
+            original_order INTEGER,
             created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP::text)
         );
 
@@ -245,6 +253,15 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
         );
         """
     )
+    # Columnas agregadas después del despliegue inicial: se aplican con
+    # IF NOT EXISTS para que sea seguro correr esto sobre una base ya existente.
+    conn.executescript(
+        """
+        ALTER TABLE teams ADD COLUMN IF NOT EXISTS schedule_day TEXT;
+        ALTER TABLE teams ADD COLUMN IF NOT EXISTS schedule_time TEXT;
+        ALTER TABLE teams ADD COLUMN IF NOT EXISTS original_order INTEGER;
+        """
+    )
 
 
 def seed_users(conn: sqlite3.Connection) -> None:
@@ -270,86 +287,77 @@ def seed_users(conn: sqlite3.Connection) -> None:
             )
 
 
-def shared_strings_from_xlsx(zip_file: zipfile.ZipFile) -> list[str]:
-    if "xl/sharedStrings.xml" not in zip_file.namelist():
-        return []
-    namespace = {"a": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
-    tree = ET.fromstring(zip_file.read("xl/sharedStrings.xml"))
-    values: list[str] = []
-    for item in tree.findall("a:si", namespace):
-        values.append("".join(node.text or "" for node in item.iterfind(".//a:t", namespace)))
-    return values
+def parse_teams_csv(csv_path: Path | None = None) -> list[dict[str, Any]]:
+    """Lee el cronograma de equipos desde teams_schedule.csv (separado por ';').
 
+    Formato esperado (una fila de encabezado, luego una fila por equipo,
+    con el día repetido en cada fila):
+    Dia;Nombre del equipo;Horario;Descripcion del proyecto;
+    Nombre Completo participante lider;Pais;Universidad/Filial;Linea tematica
 
-def cell_text(cell: ET.Element, shared_strings: list[str], namespace: dict[str, str]) -> str:
-    cell_type = cell.attrib.get("t")
-    if cell_type == "s":
-        value = cell.find("a:v", namespace)
-        return shared_strings[int(value.text)] if value is not None and value.text is not None else ""
-    if cell_type == "inlineStr":
-        return "".join(node.text or "" for node in cell.iterfind(".//a:t", namespace))
-    value = cell.find("a:v", namespace)
-    return value.text if value is not None and value.text is not None else ""
-
-
-def parse_pitch_workbook() -> list[dict[str, Any]]:
-    if not EXCEL_PATH.exists():
+    Filas sin nombre de equipo, o con "RECESO" como nombre, se ignoran
+    (son recesos del cronograma, no equipos). El orden de los equipos en
+    el archivo se conserva tal cual (día 19 primero, luego día 20)."""
+    path = csv_path or TEAMS_CSV_PATH
+    if not path.exists():
         return []
 
-    namespace = {
-        "a": "http://schemas.openxmlformats.org/spreadsheetml/2006/main",
-        "r": "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
-        "p": "http://schemas.openxmlformats.org/package/2006/relationships",
-    }
+    import csv as csv_module
 
-    rows: list[dict[str, Any]] = []
-    with zipfile.ZipFile(EXCEL_PATH) as workbook:
-        workbook_xml = ET.fromstring(workbook.read("xl/workbook.xml"))
-        rels_xml = ET.fromstring(workbook.read("xl/_rels/workbook.xml.rels"))
-        relmap = {rel.attrib["Id"]: rel.attrib["Target"] for rel in rels_xml}
-        shared_strings = shared_strings_from_xlsx(workbook)
-        sheet = workbook_xml.find("a:sheets/a:sheet", namespace)
-        if sheet is None:
-            return []
-        sheet_target = "xl/" + relmap[sheet.attrib["{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id"]]
-        sheet_xml = ET.fromstring(workbook.read(sheet_target))
-        sheet_rows = sheet_xml.findall("a:sheetData/a:row", namespace)
-        if not sheet_rows:
-            return []
+    with path.open(encoding="utf-8-sig", newline="") as handle:
+        reader = csv_module.reader(handle, delimiter=";")
+        rows = list(reader)
 
-        headers = [cell_text(cell, shared_strings, namespace).strip() for cell in sheet_rows[0].findall("a:c", namespace)]
-        for source_row, row in enumerate(sheet_rows[1:], start=2):
-            values = [cell_text(cell, shared_strings, namespace).strip() for cell in row.findall("a:c", namespace)]
-            row_map = {headers[index]: values[index] if index < len(values) else "" for index in range(len(headers))}
-            team_name = row_map.get("Nombre del equipo", "").strip()
-            if not team_name:
-                continue
-            rows.append(
-                {
-                    "display_order": len(rows) + 1,
-                    "name": team_name,
-                    "description": row_map.get("Descripción del proyecto", "").strip(),
-                    "leader": row_map.get("Nombre Completo particpante lider", row_map.get("Nombre Completo particpante lider\n", "")).strip(),
-                    "country": row_map.get("Pais", "").strip(),
-                    "university": row_map.get("Universidad/Filial", "").strip(),
-                    "filial": "",
-                    "theme_line": row_map.get("Línea temática", "").strip(),
-                    "source_row": source_row,
-                }
-            )
-    return rows
+    if not rows:
+        return []
+
+    teams: list[dict[str, Any]] = []
+    for source_row, row in enumerate(rows[1:], start=2):
+        row = row + [""] * max(0, 8 - len(row))
+        team_name = row[1].strip()
+        if not team_name or team_name.upper() == "RECESO":
+            continue
+        teams.append(
+            {
+                "display_order": len(teams) + 1,
+                "name": team_name,
+                "schedule_time": row[2].strip(),
+                "description": row[3].strip(),
+                "leader": row[4].strip(),
+                "country": row[5].strip(),
+                "university": row[6].strip(),
+                "filial": "",
+                "theme_line": row[7].strip(),
+                "source_row": source_row,
+                "schedule_day": row[0].strip(),
+            }
+        )
+    return teams
 
 
 def seed_teams(conn: sqlite3.Connection) -> None:
     if conn.execute("SELECT COUNT(*) FROM teams").fetchone()[0]:
         return
-    teams = parse_pitch_workbook()
+    replace_all_teams(conn, parse_teams_csv())
+
+
+def replace_all_teams(conn: sqlite3.Connection, teams: list[dict[str, Any]]) -> None:
+    """Borra todos los equipos existentes (y todo lo que dependa de ellos:
+    evaluaciones, inasistencias, historial de ranking y mejoras de IA) y
+    los reemplaza por la lista dada, en el orden recibido. Se usa tanto
+    para el primer arranque como para recargar el cronograma desde cero."""
+    conn.execute("DELETE FROM ranking_history")
+    conn.execute("DELETE FROM ai_improvements")
+    conn.execute("DELETE FROM no_shows")
+    conn.execute("DELETE FROM evaluations")
+    conn.execute("DELETE FROM teams")
     for team in teams:
         conn.execute(
             """
             INSERT INTO teams (
-                display_order, name, description, leader, country, university, filial, theme_line, source_row
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                display_order, name, description, leader, country, university,
+                filial, theme_line, source_row, schedule_day, schedule_time, original_order
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 team["display_order"],
@@ -361,6 +369,9 @@ def seed_teams(conn: sqlite3.Connection) -> None:
                 team["filial"],
                 team["theme_line"],
                 team["source_row"],
+                team["schedule_day"],
+                team["schedule_time"],
+                team["display_order"],
             ),
         )
 
@@ -445,6 +456,8 @@ def compute_team_stats(conn: sqlite3.Connection) -> tuple[list[dict[str, Any]], 
             "filial": team["filial"] or "",
             "theme_line": team["theme_line"],
             "source_row": team["source_row"],
+            "schedule_day": team["schedule_day"],
+            "schedule_time": team["schedule_time"],
             "manual_position": team["manual_position"],
             "evaluation_count": evaluation_count,
             "no_show_count": no_show_count,
@@ -629,6 +642,8 @@ def serialize_team(team: dict[str, Any]) -> dict[str, Any]:
         "filial": team["filial"],
         "theme_line": team["theme_line"],
         "source_row": team["source_row"],
+        "schedule_day": team.get("schedule_day"),
+        "schedule_time": team.get("schedule_time"),
         "manual_position": team.get("manual_position"),
         "evaluation_count": team["evaluation_count"],
         "no_show_count": team.get("no_show_count", 0),
@@ -689,6 +704,75 @@ def get_evaluated_team_ids(conn: sqlite3.Connection, juror_id: int) -> set[int]:
 def get_juror_no_show_ids(conn: sqlite3.Connection, juror_id: int) -> set[int]:
     rows = conn.execute("SELECT team_id FROM no_shows WHERE juror_id = ?", (juror_id,)).fetchall()
     return {row["team_id"] for row in rows}
+
+
+def move_team_to_end_of_its_day(conn: sqlite3.Connection, team_id: int) -> None:
+    """Mueve un equipo al final de la fila de SU día (19 o 20 de agosto),
+    sin tocar el orden de presentación del otro día. Si el equipo no tiene
+    día asignado, cae al final de toda la lista (comportamiento anterior)."""
+    team = conn.execute(
+        "SELECT id, display_order, schedule_day FROM teams WHERE id = ?", (team_id,)
+    ).fetchone()
+    if team is None:
+        return
+    old_order = team["display_order"]
+    day = team["schedule_day"]
+
+    if day:
+        max_order = conn.execute(
+            "SELECT MAX(display_order) FROM teams WHERE schedule_day = ?", (day,)
+        ).fetchone()[0]
+    else:
+        max_order = conn.execute("SELECT MAX(display_order) FROM teams").fetchone()[0]
+
+    if max_order is None or old_order >= max_order:
+        return  # ya está al final de su día (o de la lista)
+
+    # PostgreSQL puede validar la restricción UNIQUE(display_order) FILA POR FILA
+    # dentro de un mismo UPDATE, no solo al terminar el statement. Si movemos de
+    # golpe un rango completo con "display_order - 1", el orden interno en que
+    # Postgres visite esas filas puede hacer que, transitoriamente, dos filas
+    # queden con el mismo valor -> UniqueViolation (esto es justo lo que pasó).
+    # Para evitarlo del todo, cada paso de abajo es una simple traslación
+    # aritmética (sumar/restar la MISMA constante a todas las filas afectadas),
+    # que por definición nunca puede hacer que dos valores distintos terminen
+    # siendo iguales, sin importar en qué orden Postgres procese las filas.
+    HOLDING_OFFSET = 1_000_000_000
+    HOLDING_THRESHOLD = -500_000_000
+
+    # 1) Sacar al equipo del medio de la fila (valor negativo único: no puede
+    #    chocar con ningún display_order real).
+    conn.execute("UPDATE teams SET display_order = -id WHERE id = ?", (team_id,))
+
+    # 2) Mandar el resto de la fila (los que quedaban después de este equipo)
+    #    a una zona "de espera" muy alejada de cualquier valor real.
+    if day:
+        conn.execute(
+            "UPDATE teams SET display_order = display_order - ? "
+            "WHERE schedule_day = ? AND display_order > ?",
+            (HOLDING_OFFSET, day, old_order),
+        )
+    else:
+        conn.execute(
+            "UPDATE teams SET display_order = display_order - ? WHERE display_order > ?",
+            (HOLDING_OFFSET, old_order),
+        )
+
+    # 3) Traerlos de vuelta, ahora un puesto más arriba que antes.
+    if day:
+        conn.execute(
+            "UPDATE teams SET display_order = display_order + ? "
+            "WHERE schedule_day = ? AND display_order < ?",
+            (HOLDING_OFFSET - 1, day, HOLDING_THRESHOLD),
+        )
+    else:
+        conn.execute(
+            "UPDATE teams SET display_order = display_order + ? WHERE display_order < ?",
+            (HOLDING_OFFSET - 1, HOLDING_THRESHOLD),
+        )
+
+    # 4) Ubicar al equipo al final de su día.
+    conn.execute("UPDATE teams SET display_order = ? WHERE id = ?", (max_order, team_id))
 
 
 GEMINI_MODEL = "gemini-2.5-flash"
@@ -795,14 +879,30 @@ def get_next_pending_team_id(
     """Return the next team (in display order) this juror should evaluate.
 
     Teams the juror has already evaluated are always skipped. Teams this
-    juror personally marked as 'No asistió' are deprioritized: skipped on
-    the first pass, but if nothing else is left to evaluate, they resurface
-    (so the juror still gets to them eventually, just last)."""
+    juror personally marked as 'No asistió' are deprioritized: skipped as
+    long as there's another pending team left *on the same schedule day*,
+    but once that day is otherwise finished they resurface (so the juror
+    reaches them last within that day, matching where 'No asistió' visually
+    moved them via move_team_to_end_of_its_day). They don't get pushed past
+    a day boundary just because the *other* day still has pending teams."""
     if not team_rows:
         return None
     evaluated_ids = get_evaluated_team_ids(conn, juror_id)
     deprioritized_ids = get_juror_no_show_ids(conn, juror_id) - evaluated_ids
     ids = [row["id"] for row in team_rows]
+    day_by_id = {row["id"]: row["schedule_day"] for row in team_rows}
+
+    # Count, per schedule day, how many teams are still pending for this
+    # juror *and not deprioritized*. A deprioritized team only needs to wait
+    # for its own day's pending count to hit zero, not the whole list's.
+    pending_per_day: dict[Any, int] = {}
+    for row in team_rows:
+        tid = row["id"]
+        if tid in evaluated_ids or tid in deprioritized_ids:
+            continue
+        day = row["schedule_day"]
+        pending_per_day[day] = pending_per_day.get(day, 0) + 1
+
     start_index = 0
     if after_team_id is not None and after_team_id in ids:
         start_index = ids.index(after_team_id) + 1
@@ -810,12 +910,11 @@ def get_next_pending_team_id(
 
     for idx in ordered_indices:
         candidate = ids[idx]
-        if candidate not in evaluated_ids and candidate not in deprioritized_ids:
-            return candidate
-    for idx in ordered_indices:
-        candidate = ids[idx]
-        if candidate not in evaluated_ids:
-            return candidate
+        if candidate in evaluated_ids:
+            continue
+        if candidate in deprioritized_ids and pending_per_day.get(day_by_id[candidate], 0) > 0:
+            continue
+        return candidate
     return after_team_id if after_team_id is not None else ids[0]
 
 
@@ -1590,7 +1689,10 @@ class InnovatePitchHandler(SimpleHTTPRequestHandler):
             conn.execute("DELETE FROM ranking_history")
             conn.execute("DELETE FROM no_shows")
             conn.execute("DELETE FROM ai_improvements")
-            conn.execute("UPDATE teams SET manual_position = NULL")
+            conn.execute(
+                "UPDATE teams SET manual_position = NULL, "
+                "display_order = COALESCE(original_order, display_order)"
+            )
             conn.commit()
             record_ranking_history(conn, None)
             conn.commit()
@@ -1682,14 +1784,13 @@ class InnovatePitchHandler(SimpleHTTPRequestHandler):
             consensus = active_juror_count > 0 and no_show_count >= active_juror_count
 
             if consensus:
-                max_order = conn.execute("SELECT MAX(display_order) FROM teams").fetchone()[0] or 0
-                conn.execute("UPDATE teams SET display_order = ? WHERE id = ?", (max_order + 1, team_id))
+                move_team_to_end_of_its_day(conn, team_id)
                 conn.commit()
 
             dashboard = get_jury_dashboard(conn, user["id"], None)
 
         if consensus:
-            message = "Todos los jurados marcaron este equipo como 'No asistió'. Se movió al final de la lista para todos."
+            message = "Todos los jurados marcaron este equipo como 'No asistió'. Se movió al final de la fila de su día."
         else:
             message = f"Marcaste este equipo como 'No asistió' ({no_show_count}/{active_juror_count} jurados). Continuando con el siguiente equipo pendiente."
         send_json(self, {"ok": True, "message": message, "dashboard": dashboard})
@@ -1824,4 +1925,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

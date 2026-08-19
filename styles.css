@@ -906,6 +906,11 @@ select:focus {
   gap: 12px;
 }
 
+.navigation-card__team {
+  margin: 0;
+  font-size: 1.02rem;
+}
+
 .navigation-actions {
   display: flex;
   flex-wrap: wrap;

@@ -9,7 +9,7 @@ TABLES = [
     ("teams", [
         "id", "display_order", "name", "description", "leader", "country",
         "university", "filial", "theme_line", "source_row", "created_at",
-        "manual_position",
+        "manual_position", "schedule_day", "schedule_time", "original_order",
     ]),
     ("evaluations", [
         "id", "team_id", "juror_id", "problem_score", "value_score",
