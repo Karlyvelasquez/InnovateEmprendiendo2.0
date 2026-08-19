@@ -17,6 +17,7 @@ const state = {
   confirmingDeliberation: false,
   confirmingResetEvaluations: false,
   resettingEvaluations: false,
+  confirmingNoShow: false,
   aiImproving: false,
   aiOriginalByTeam: {},
 };
@@ -690,6 +691,26 @@ function renderJuryDashboard() {
   }
 
   const currentDraft = state.juryDraft;
+  const confirmNoShowModal = state.confirmingNoShow
+    ? `
+      <div class="modal active" aria-hidden="false">
+        <div class="modal__backdrop" data-action="cancel-jury-no-show"></div>
+        <div class="modal__panel card" style="width:min(440px, 100%);">
+          <div class="modal__header">
+            <div>
+              <p class="section-label">Confirmación</p>
+              <h3>¿Estás seguro de marcar a ${escapeHtml(currentSummary?.name || 'este equipo')} como "No asistió"?</h3>
+            </div>
+          </div>
+          <p class="muted">Recuerda que esto hará que el equipo se vaya al final de la lista de su día para calificar.</p>
+          <div style="display:flex; justify-content:flex-end; gap:8px; margin-top:18px;">
+            <button class="button button--ghost" type="button" data-action="cancel-jury-no-show">Cancelar</button>
+            <button class="button button--danger" type="button" data-action="confirm-jury-no-show">Sí, no asistió</button>
+          </div>
+        </div>
+      </div>
+    `
+    : '';
   const teamInfo = currentSummary
     ? `
       <article class="team-card">
@@ -811,6 +832,7 @@ function renderJuryDashboard() {
         <div class="inline-feedback">${state.juryDirty ? 'Tienes cambios sin guardar.' : 'Al guardar avanzas automáticamente al siguiente equipo pendiente. Si el equipo no se presentó, usa "No asistió" para pasarlo al final de la lista.'}</div>
       </section>
     </div>
+    ${confirmNoShowModal}
   `;
 }
 
@@ -1035,14 +1057,29 @@ function handleAiRevert() {
   render();
 }
 
-async function handleJuryNoShow() {
+function startJuryNoShow() {
   if (state.role !== 'jury' || !state.dashboard?.current_team_id) return;
   const rubricAlreadyScored = scoreFields.every((key) => isValidScoreValue(state.juryDraft?.scores?.[key]));
   if (rubricAlreadyScored) {
     setToast('Ya calificaste este equipo, no puedes marcarlo como no asistió.', 'error');
     return;
   }
-  if (!confirmDiscardChanges()) return;
+  state.confirmingNoShow = true;
+  render();
+}
+
+function cancelJuryNoShow() {
+  state.confirmingNoShow = false;
+  render();
+}
+
+async function confirmJuryNoShow() {
+  if (state.role !== 'jury' || !state.dashboard?.current_team_id) return;
+  if (!confirmDiscardChanges()) {
+    state.confirmingNoShow = false;
+    render();
+    return;
+  }
 
   const teamId = state.dashboard.current_team_id;
   try {
@@ -1054,11 +1091,14 @@ async function handleJuryNoShow() {
     state.juryDraft = buildDraftFromEvaluation(response.dashboard.current_evaluation);
     state.juryDirty = false;
     state.activeTeamId = response.dashboard.current_team_id;
+    state.confirmingNoShow = false;
     render();
     scrollDashboardToTop();
     setToast(response.message || "Equipo marcado como 'No asistió'.");
   } catch (error) {
+    state.confirmingNoShow = false;
     setToast(error.message, 'error');
+    render();
   }
 }
 
@@ -1164,7 +1204,17 @@ function handleRootClick(event) {
   }
 
   if (action === 'jury-no-show') {
-    handleJuryNoShow();
+    startJuryNoShow();
+    return;
+  }
+
+  if (action === 'cancel-jury-no-show') {
+    cancelJuryNoShow();
+    return;
+  }
+
+  if (action === 'confirm-jury-no-show') {
+    confirmJuryNoShow();
     return;
   }
 
