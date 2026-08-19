@@ -1689,9 +1689,24 @@ class InnovatePitchHandler(SimpleHTTPRequestHandler):
             conn.execute("DELETE FROM ranking_history")
             conn.execute("DELETE FROM no_shows")
             conn.execute("DELETE FROM ai_improvements")
+            conn.execute("UPDATE teams SET manual_position = NULL")
+            # display_order has a UNIQUE constraint. If any team's current
+            # display_order was shuffled by a "No asistió" consensus move,
+            # restoring everyone straight to original_order in a single
+            # UPDATE can transiently collide two rows on the same value
+            # while PostgreSQL processes the statement row by row, raising
+            # a UniqueViolation (500). Stage through a temporary negative
+            # offset first (guaranteed not to collide with any real,
+            # positive display_order) so the final UPDATE never has two
+            # rows sharing a value at any point.
+            RESET_HOLDING_OFFSET = 1_000_000_000
             conn.execute(
-                "UPDATE teams SET manual_position = NULL, "
-                "display_order = COALESCE(original_order, display_order)"
+                "UPDATE teams SET display_order = -display_order - ?",
+                (RESET_HOLDING_OFFSET,),
+            )
+            conn.execute(
+                "UPDATE teams SET display_order = COALESCE(original_order, -display_order - ?)",
+                (RESET_HOLDING_OFFSET,),
             )
             conn.commit()
             record_ranking_history(conn, None)
