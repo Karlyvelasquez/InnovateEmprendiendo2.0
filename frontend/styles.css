@@ -27,7 +27,7 @@ body {
   font-family: "Segoe UI", Tahoma, Geneva, Verdana, sans-serif;
   background:
     linear-gradient(180deg, rgba(9, 22, 16, 0.55), rgba(9, 22, 16, 0.62)),
-    url('fondo.png');
+    url('assets/fondo.png');
   background-size: cover;
   background-position: center;
   background-repeat: no-repeat;
@@ -887,20 +887,6 @@ select:focus {
   margin-top: 12px;
 }
 
-.ai-actions {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 10px;
-  margin-top: 10px;
-}
-
-.ai-used-note {
-  font-size: 0.85rem;
-  color: var(--secondary, #6b8f7a);
-  font-style: italic;
-}
-
 .navigation-card {
   display: grid;
   gap: 12px;
@@ -1329,5 +1315,518 @@ select:focus {
   /* Evita que badges o etiquetas desborden */
   .badge {
     max-width: 100%;
+  }
+}
+
+/* ---------------------------------------------------------
+   ADMIN: selector de Pitch y control para jurados
+--------------------------------------------------------- */
+.pitch-tiles {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 14px;
+}
+
+.pitch-tile {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 18px;
+  text-align: left;
+  font: inherit;
+  color: var(--text);
+  background: #ffffff;
+  border: 1px solid var(--border);
+  border-radius: 18px;
+  cursor: pointer;
+  transition: transform 0.15s ease, box-shadow 0.15s ease, border-color 0.15s ease;
+}
+
+.pitch-tile:hover,
+.pitch-tile:focus-visible {
+  transform: translateY(-2px);
+  border-color: var(--primary);
+  box-shadow: 0 14px 30px rgba(17, 122, 67, 0.14);
+  outline: none;
+}
+
+.pitch-tile--live {
+  border-color: rgba(17, 122, 67, 0.45);
+  background: linear-gradient(180deg, #ffffff, var(--primary-soft));
+}
+
+.pitch-tile__top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-height: 40px;
+}
+
+.pitch-tile__number {
+  display: inline-grid;
+  place-items: center;
+  width: 40px;
+  height: 40px;
+  border-radius: 12px;
+  font-weight: 800;
+  font-size: 1.1rem;
+  color: var(--primary-strong);
+  background: var(--primary-soft);
+}
+
+.pitch-tile--live .pitch-tile__number {
+  color: #ffffff;
+  background: linear-gradient(135deg, var(--primary), var(--primary-strong));
+}
+
+.pitch-tile__title {
+  font-size: 1.05rem;
+  font-weight: 800;
+}
+
+.pitch-tile__cta {
+  margin-top: auto;
+  font-size: 0.86rem;
+  font-weight: 700;
+  color: var(--primary);
+}
+
+.live-pill,
+.soon-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 5px 11px;
+  border-radius: 999px;
+  font-size: 0.76rem;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.live-pill {
+  color: var(--primary-strong);
+  background: #dff3e7;
+}
+
+.live-pill--lg {
+  padding: 8px 14px;
+  font-size: 0.92rem;
+}
+
+.soon-pill {
+  color: var(--muted);
+  background: #f0f3f1;
+}
+
+.live-dot {
+  position: relative;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--primary);
+  flex-shrink: 0;
+}
+
+.live-dot::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border-radius: 50%;
+  background: var(--primary);
+  animation: live-pulse 1.8s ease-out infinite;
+}
+
+@keyframes live-pulse {
+  0% { transform: scale(1); opacity: 0.7; }
+  100% { transform: scale(2.6); opacity: 0; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .live-dot::after { animation: none; }
+}
+
+.jury-control__header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 16px;
+  margin-bottom: 16px;
+}
+
+.jury-control__now {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.jury-control__now-label,
+.pitch-bar__label {
+  font-size: 0.72rem;
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.segmented {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 6px;
+  padding: 6px;
+  border-radius: 18px;
+  background: #eef5f0;
+  border: 1px solid var(--border);
+}
+
+.segment {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 4px;
+  padding: 12px 14px;
+  font: inherit;
+  text-align: left;
+  color: var(--secondary);
+  background: transparent;
+  border: 0;
+  border-radius: 13px;
+  cursor: pointer;
+  transition: background 0.15s ease, box-shadow 0.15s ease, color 0.15s ease;
+}
+
+.segment:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.8);
+}
+
+.segment:disabled {
+  cursor: default;
+}
+
+.segment__title {
+  font-weight: 800;
+}
+
+.segment__state {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 0.82rem;
+  font-weight: 600;
+  color: var(--muted);
+}
+
+.segment--active {
+  background: #ffffff;
+  color: var(--primary-strong);
+  box-shadow: 0 6px 18px rgba(17, 122, 67, 0.16);
+}
+
+.segment--active .segment__state {
+  color: var(--primary);
+}
+
+.pitch-bar {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  flex-wrap: wrap;
+  margin-bottom: 12px;
+  padding: 12px 16px;
+}
+
+.pitch-bar__info {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin-right: auto;
+}
+
+.pitch-bar__note {
+  font-size: 0.88rem;
+}
+
+@media (max-width: 760px) {
+  .pitch-tiles,
+  .segmented {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .jury-control__header {
+    flex-direction: column;
+  }
+
+  .jury-control__now {
+    align-items: flex-start;
+  }
+}
+
+/* ---------------------------------------------------------
+   ADMIN: orden de presentación para jurados
+--------------------------------------------------------- */
+.button--sm {
+  padding: 6px 11px;
+  border-radius: 10px;
+  font-size: 0.82rem;
+}
+
+.button--danger-ghost {
+  color: var(--danger);
+  background: #fff;
+  border: 1px solid #f1c9c9;
+}
+
+.button--danger-ghost:hover:not(:disabled) {
+  background: #fdf1f1;
+}
+
+.presentation-card .detail-header__actions {
+  flex-direction: row;
+  flex-shrink: 0;
+}
+
+.presentation-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: 480px;
+  overflow-y: auto;
+  padding-right: 4px;
+}
+
+.presentation-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  background: #fff;
+}
+
+.presentation-row--editing {
+  cursor: grab;
+}
+
+.presentation-row--editing.dragging {
+  opacity: 0.45;
+  cursor: grabbing;
+}
+
+.presentation-row__pos {
+  display: inline-grid;
+  place-items: center;
+  min-width: 32px;
+  height: 32px;
+  border-radius: 10px;
+  font-weight: 800;
+  font-size: 0.9rem;
+  color: var(--primary-strong);
+  background: var(--primary-soft);
+  flex-shrink: 0;
+}
+
+.presentation-row__info {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  flex: 1;
+  min-width: 0;
+}
+
+.presentation-row__info strong {
+  overflow-wrap: anywhere;
+}
+
+.presentation-row__info .muted {
+  font-size: 0.82rem;
+}
+
+.presentation-row__actions {
+  display: flex;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.presentation-inactive {
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px dashed var(--border);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.presentation-inactive__title {
+  margin: 0 0 4px;
+  font-size: 0.78rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.presentation-row--inactive {
+  background: #f6f8f7;
+}
+
+.presentation-row--inactive .presentation-row__info strong {
+  color: var(--muted);
+  text-decoration: line-through;
+}
+
+.presentation-row--inactive .presentation-row__pos {
+  color: var(--muted);
+  background: #eceff0;
+}
+
+@media (max-width: 760px) {
+  .presentation-row {
+    flex-wrap: wrap;
+  }
+
+  .presentation-row__actions {
+    width: 100%;
+    justify-content: flex-end;
+  }
+}
+
+/* ---------------------------------------------------------
+   JURADO: pantalla de evaluación completada
+--------------------------------------------------------- */
+.jury-complete {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+  gap: 6px;
+  padding: 40px 24px;
+}
+
+.jury-complete__icon {
+  display: grid;
+  place-items: center;
+  width: 64px;
+  height: 64px;
+  margin-bottom: 8px;
+  border-radius: 50%;
+  font-size: 2rem;
+  font-weight: 800;
+  color: #ffffff;
+  background: linear-gradient(135deg, var(--primary), var(--primary-strong));
+  box-shadow: 0 14px 30px rgba(17, 122, 67, 0.25);
+}
+
+.jury-complete h3 {
+  margin: 0;
+  font-size: 1.5rem;
+}
+
+.jury-complete__thanks {
+  margin: 4px 0 10px;
+  max-width: 520px;
+  font-size: 1.08rem;
+  color: var(--text);
+}
+
+.jury-complete__note {
+  margin: 12px 0 0;
+  font-size: 0.88rem;
+}
+
+
+/* ---------------------------------------------------------
+   ADMIN: jurados
+--------------------------------------------------------- */
+.juror-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.juror-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  background: #fff;
+}
+
+.juror-row__avatar {
+  display: inline-grid;
+  place-items: center;
+  width: 38px;
+  height: 38px;
+  border-radius: 50%;
+  font-weight: 800;
+  font-size: 0.85rem;
+  color: var(--primary-strong);
+  background: var(--primary-soft);
+  flex-shrink: 0;
+}
+
+.juror-row__info {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  flex: 1;
+  min-width: 0;
+}
+
+.juror-row__info .muted {
+  font-size: 0.82rem;
+  overflow-wrap: anywhere;
+}
+
+.juror-row__counts {
+  font-size: 0.82rem;
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.juror-status {
+  padding: 4px 10px;
+  border-radius: 999px;
+  font-size: 0.76rem;
+  font-weight: 700;
+  color: var(--muted);
+  background: #eceff0;
+  white-space: nowrap;
+}
+
+.juror-status--active {
+  color: var(--primary-strong);
+  background: #dff3e7;
+}
+
+.juror-row__actions {
+  flex-shrink: 0;
+}
+
+.juror-row--inactive {
+  background: #f6f8f7;
+}
+
+.juror-row--inactive .juror-row__avatar {
+  color: var(--muted);
+  background: #eceff0;
+}
+
+.juror-row--inactive .juror-row__info strong {
+  color: var(--muted);
+}
+
+@media (max-width: 760px) {
+  .juror-row {
+    flex-wrap: wrap;
+  }
+
+  .juror-row__counts {
+    width: 100%;
+    order: 5;
   }
 }

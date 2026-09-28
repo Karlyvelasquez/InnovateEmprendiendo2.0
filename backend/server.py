@@ -26,6 +26,8 @@ import xml.etree.ElementTree as ET
 from xml.sax.saxutils import escape as xml_escape
 
 ROOT = Path(__file__).resolve().parent
+# Archivos estáticos del frontend (index.html, app.js, styles.css, assets/).
+FRONTEND_DIR = ROOT.parent / "frontend"
 DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
 TEAMS_CSV_PATH = ROOT / "teams_schedule.csv"
 # Tamaño de "bloque" reservado para cada día en display_order. Los equipos de
@@ -40,7 +42,11 @@ PBKDF2_ITERATIONS = 210_000
 ROLE_ADMIN = "admin"
 ROLE_JURY = "jury"
 WINNERS_COUNT = 20
-SUPER_ADMIN_IDENTIFIER = "karly.velasquez@epm.com.co"
+FINALISTS_COUNT = 10
+PITCH_ONE = 1
+PITCH_TWO = 2
+PITCH_THREE = 3
+ACTIVE_PITCH_SETTING_KEY = "active_pitch"
 
 def load_seed_users() -> list[dict[str, str]]:
     """Load the admin/jury account list, preferring the USERS_SEED_JSON
@@ -131,9 +137,20 @@ def iso_now() -> str:
 
 
 def db_connect() -> sqlite3.Connection:
-    if not DATABASE_URL:
+    database_url = os.environ.get("DATABASE_URL", "").strip()
+    if not database_url:
         raise RuntimeError("Falta la variable de entorno DATABASE_URL de Neon.")
-    return sqlite3.connect(DATABASE_URL)
+    conn = sqlite3.connect(database_url)
+    try:
+        # Defensive: if the underlying connection is being reused/shared across
+        # requests (as opposed to opened fresh each time), it may be sitting
+        # inside a leftover transaction with a stale snapshot of the data.
+        # Rolling back here is always safe (there should be no pending writes
+        # of ours yet) and guarantees the next queries see current committed data.
+        conn.rollback()
+    except Exception:
+        pass
+    return conn
 
 
 def pbkdf2_hash(password: str, salt: bytes | None = None) -> str:
@@ -193,6 +210,7 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
 
         CREATE TABLE IF NOT EXISTS evaluations (
             id BIGSERIAL PRIMARY KEY,
+            pitch_id INTEGER NOT NULL DEFAULT 1,
             team_id BIGINT NOT NULL,
             juror_id BIGINT NOT NULL,
             problem_score DOUBLE PRECISION NOT NULL,
@@ -205,13 +223,14 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
             final_score_100 DOUBLE PRECISION NOT NULL,
             created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP::text),
             updated_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP::text),
-            UNIQUE(team_id, juror_id),
+            UNIQUE(pitch_id, team_id, juror_id),
             FOREIGN KEY(team_id) REFERENCES teams(id) ON DELETE CASCADE,
             FOREIGN KEY(juror_id) REFERENCES users(id) ON DELETE CASCADE
         );
 
         CREATE TABLE IF NOT EXISTS ranking_history (
             id BIGSERIAL PRIMARY KEY,
+            pitch_id INTEGER NOT NULL DEFAULT 1,
             team_id BIGINT NOT NULL,
             evaluation_id BIGINT,
             position INTEGER NOT NULL,
@@ -224,20 +243,22 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
 
         CREATE TABLE IF NOT EXISTS no_shows (
             id BIGSERIAL PRIMARY KEY,
+            pitch_id INTEGER NOT NULL DEFAULT 1,
             team_id BIGINT NOT NULL,
             juror_id BIGINT NOT NULL,
             created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP::text),
-            UNIQUE(team_id, juror_id),
+            UNIQUE(pitch_id, team_id, juror_id),
             FOREIGN KEY(team_id) REFERENCES teams(id) ON DELETE CASCADE,
             FOREIGN KEY(juror_id) REFERENCES users(id) ON DELETE CASCADE
         );
 
         CREATE TABLE IF NOT EXISTS ai_improvements (
             id BIGSERIAL PRIMARY KEY,
+            pitch_id INTEGER NOT NULL DEFAULT 1,
             team_id BIGINT NOT NULL,
             juror_id BIGINT NOT NULL,
             used_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP::text),
-            UNIQUE(team_id, juror_id),
+            UNIQUE(pitch_id, team_id, juror_id),
             FOREIGN KEY(team_id) REFERENCES teams(id) ON DELETE CASCADE,
             FOREIGN KEY(juror_id) REFERENCES users(id) ON DELETE CASCADE
         );
@@ -251,6 +272,20 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
             last_seen_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP::text),
             FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
         );
+
+        CREATE TABLE IF NOT EXISTS app_settings (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS pitch_team_settings (
+            pitch_id INTEGER NOT NULL,
+            team_id BIGINT NOT NULL,
+            sort_order INTEGER,
+            deactivated INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (pitch_id, team_id),
+            FOREIGN KEY(team_id) REFERENCES teams(id) ON DELETE CASCADE
+        );
         """
     )
     # Columnas agregadas después del despliegue inicial: se aplican con
@@ -260,8 +295,18 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
         ALTER TABLE teams ADD COLUMN IF NOT EXISTS schedule_day TEXT;
         ALTER TABLE teams ADD COLUMN IF NOT EXISTS schedule_time TEXT;
         ALTER TABLE teams ADD COLUMN IF NOT EXISTS original_order INTEGER;
+        ALTER TABLE evaluations ADD COLUMN IF NOT EXISTS pitch_id INTEGER NOT NULL DEFAULT 1;
+        ALTER TABLE ranking_history ADD COLUMN IF NOT EXISTS pitch_id INTEGER NOT NULL DEFAULT 1;
+        ALTER TABLE no_shows ADD COLUMN IF NOT EXISTS pitch_id INTEGER NOT NULL DEFAULT 1;
+        ALTER TABLE ai_improvements ADD COLUMN IF NOT EXISTS pitch_id INTEGER NOT NULL DEFAULT 1;
         """
     )
+    conn.execute("ALTER TABLE evaluations DROP CONSTRAINT IF EXISTS evaluations_team_id_juror_id_key")
+    conn.execute("ALTER TABLE no_shows DROP CONSTRAINT IF EXISTS no_shows_team_id_juror_id_key")
+    conn.execute("ALTER TABLE ai_improvements DROP CONSTRAINT IF EXISTS ai_improvements_team_id_juror_id_key")
+    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS evaluations_pitch_team_juror_key ON evaluations (pitch_id, team_id, juror_id)")
+    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS no_shows_pitch_team_juror_key ON no_shows (pitch_id, team_id, juror_id)")
+    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS ai_improvements_pitch_team_juror_key ON ai_improvements (pitch_id, team_id, juror_id)")
 
 
 def seed_users(conn: sqlite3.Connection) -> None:
@@ -350,6 +395,7 @@ def replace_all_teams(conn: sqlite3.Connection, teams: list[dict[str, Any]]) -> 
     conn.execute("DELETE FROM ai_improvements")
     conn.execute("DELETE FROM no_shows")
     conn.execute("DELETE FROM evaluations")
+    conn.execute("DELETE FROM pitch_team_settings")
     conn.execute("DELETE FROM teams")
     for team in teams:
         conn.execute(
@@ -380,8 +426,35 @@ def average(values: list[float]) -> float:
     return round(sum(values) / len(values), 4) if values else 0.0
 
 
-def compute_team_stats(conn: sqlite3.Connection) -> tuple[list[dict[str, Any]], dict[int, dict[str, Any]], dict[int, list[dict[str, Any]]], int]:
-    teams = conn.execute("SELECT * FROM teams ORDER BY display_order ASC, id ASC").fetchall()
+def request_cache(conn: sqlite3.Connection) -> dict[Any, Any]:
+    """Caché de lecturas válida solo durante el request actual. pg_compat la
+    vacía ante cualquier escritura, así que nunca devuelve datos viejos. Evita
+    repetir las mismas consultas (cada una es un viaje de ida y vuelta a Neon)."""
+    cache = getattr(conn, "cache", None)
+    return cache if cache is not None else {}
+
+
+def get_all_teams(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    cache = request_cache(conn)
+    if "teams" not in cache:
+        cache["teams"] = conn.execute("SELECT * FROM teams ORDER BY display_order ASC, id ASC").fetchall()
+    return cache["teams"]
+
+
+def compute_team_stats(conn: sqlite3.Connection, pitch_id: int = PITCH_ONE, team_ids: set[int] | None = None) -> tuple[list[dict[str, Any]], dict[int, dict[str, Any]], dict[int, list[dict[str, Any]]], int]:
+    cache = request_cache(conn)
+    cache_key = ("team_stats", pitch_id, frozenset(team_ids) if team_ids is not None else None)
+    if cache_key in cache:
+        return cache[cache_key]
+    result = _compute_team_stats(conn, pitch_id, team_ids)
+    cache[cache_key] = result
+    return result
+
+
+def _compute_team_stats(conn: sqlite3.Connection, pitch_id: int, team_ids: set[int] | None) -> tuple[list[dict[str, Any]], dict[int, dict[str, Any]], dict[int, list[dict[str, Any]]], int]:
+    teams = get_all_teams(conn)
+    if team_ids is not None:
+        teams = [team for team in teams if team["id"] in team_ids]
     users = conn.execute("SELECT * FROM users WHERE active = 1").fetchall()
     jurors = [user for user in users if user["role"] == ROLE_JURY]
     eval_rows = conn.execute(
@@ -389,16 +462,20 @@ def compute_team_stats(conn: sqlite3.Connection) -> tuple[list[dict[str, Any]], 
         SELECT e.*, u.name AS juror_name, u.identifier AS juror_identifier
         FROM evaluations e
         INNER JOIN users u ON u.id = e.juror_id
+        WHERE e.pitch_id = ?
         ORDER BY e.updated_at DESC, e.id DESC
         """
+        , (pitch_id,)
     ).fetchall()
 
-    no_show_rows = conn.execute("SELECT team_id, COUNT(*) AS cnt FROM no_shows GROUP BY team_id").fetchall()
+    settings = get_pitch_team_settings(conn, pitch_id)
+    no_show_rows = conn.execute("SELECT team_id, COUNT(*) AS cnt FROM no_shows WHERE pitch_id = ? GROUP BY team_id", (pitch_id,)).fetchall()
     no_show_counts: dict[int, int] = {row["team_id"]: row["cnt"] for row in no_show_rows}
 
     evaluations_by_team: dict[int, list[sqlite3.Row]] = defaultdict(list)
     for row in eval_rows:
         evaluations_by_team[row["team_id"]].append(row)
+    active_juror_ids = {juror["id"] for juror in jurors}
 
     teams_stats: list[dict[str, Any]] = []
     stats_by_id: dict[int, dict[str, Any]] = {}
@@ -415,12 +492,19 @@ def compute_team_stats(conn: sqlite3.Connection) -> tuple[list[dict[str, Any]], 
         average_5 = average(final_5_values)
         average_100 = average(final_100_values)
         evaluation_count = len(team_evaluations)
+        # El estado se mide contra los jurados ACTIVOS: si el admin desactiva
+        # a un jurado que no asistió, ya no se espera su calificación. Sus
+        # calificaciones ya guardadas siguen contando en los promedios.
+        active_evaluation_count = len([item for item in team_evaluations if item["juror_id"] in active_juror_ids])
         no_show_count = no_show_counts.get(team["id"], 0)
-        if evaluation_count == 0 and jurors and no_show_count >= len(jurors):
+        deactivated = bool(settings.get(team["id"], {}).get("deactivated"))
+        if deactivated:
+            status = "Desactivado"
+        elif evaluation_count == 0 and jurors and no_show_count >= len(jurors):
             status = "No asistió"
         elif evaluation_count == 0:
             status = "Pendiente"
-        elif evaluation_count < len(jurors):
+        elif active_evaluation_count < len(jurors):
             status = "En progreso"
         else:
             status = "Evaluado"
@@ -460,7 +544,9 @@ def compute_team_stats(conn: sqlite3.Connection) -> tuple[list[dict[str, Any]], 
             "schedule_time": team["schedule_time"],
             "manual_position": team["manual_position"],
             "evaluation_count": evaluation_count,
+            "active_evaluation_count": active_evaluation_count,
             "no_show_count": no_show_count,
+            "deactivated": deactivated,
             "average_5": round(average_5, 4),
             "average_100": round(average_100, 4),
             "rubric_averages": {key: round(value, 4) for key, value in rubric_averages.items()},
@@ -472,8 +558,10 @@ def compute_team_stats(conn: sqlite3.Connection) -> tuple[list[dict[str, Any]], 
         evaluations_by_team_serialized[team["id"]] = serialized_evaluations
 
     def ranking_sort_key(item: dict[str, Any]) -> tuple:
-        has_manual = item["manual_position"] is not None
+        has_manual = pitch_id == PITCH_ONE and item["manual_position"] is not None
         return (
+            # Los equipos desactivados por el admin siempre quedan al final.
+            1 if item["deactivated"] else 0,
             0 if has_manual else 1,
             item["manual_position"] if has_manual else 0,
             -item["average_5"],
@@ -490,23 +578,35 @@ def compute_team_stats(conn: sqlite3.Connection) -> tuple[list[dict[str, Any]], 
     return ranking, stats_by_id, evaluations_by_team_serialized, len(jurors)
 
 
-def record_ranking_history(conn: sqlite3.Connection, evaluation_id: int | None = None) -> None:
-    ranking, _, _, _ = compute_team_stats(conn)
-    recorded_at = iso_now()
-    for item in ranking:
-        conn.execute(
-            """
-            INSERT INTO ranking_history (team_id, evaluation_id, position, score_5, score_100, recorded_at)
-            VALUES (?, ?, ?, ?, ?, ?)
-            """,
-            (item["id"], evaluation_id, item["position"], item["average_5"], item["average_100"], recorded_at),
-        )
+def record_ranking_history(conn: sqlite3.Connection, pitch_id: int = PITCH_ONE, evaluation_id: int | None = None, team_ids: set[int] | None = None) -> None:
+    ranking, _, _, _ = compute_team_stats(conn, pitch_id, team_ids)
+    if not ranking:
+        return
+    # Un solo INSERT para todos los equipos en vez de uno por equipo: cada
+    # consulta es un viaje de ida y vuelta a Neon.
+    conn.execute(
+        """
+        INSERT INTO ranking_history (pitch_id, team_id, evaluation_id, position, score_5, score_100, recorded_at)
+        SELECT ?, t.team_id, CAST(? AS BIGINT), t.position, t.score_5, t.score_100, ?
+        FROM unnest(?::bigint[], ?::integer[], ?::double precision[], ?::double precision[])
+            AS t(team_id, position, score_5, score_100)
+        """,
+        (
+            pitch_id,
+            evaluation_id,
+            iso_now(),
+            [item["id"] for item in ranking],
+            [item["position"] for item in ranking],
+            [item["average_5"] for item in ranking],
+            [item["average_100"] for item in ranking],
+        ),
+    )
 
 
 def seed_initial_history(conn: sqlite3.Connection) -> None:
     if conn.execute("SELECT COUNT(*) FROM ranking_history").fetchone()[0]:
         return
-    record_ranking_history(conn, None)
+    record_ranking_history(conn, PITCH_ONE, None)
 
 
 def initialize_database() -> None:
@@ -626,8 +726,12 @@ def serialize_user(user: sqlite3.Row) -> dict[str, Any]:
         "role": user["role"],
         "active": bool(user["active"]),
         "created_at": user["created_at"],
-        "can_reset_evaluations": user["identifier"].lower() == SUPER_ADMIN_IDENTIFIER.lower(),
     }
+
+
+def parse_pitch_id(params: dict[str, list[str]]) -> int:
+    value = params.get("pitch", [str(PITCH_ONE)])[0]
+    return int(value) if value in {str(PITCH_ONE), str(PITCH_TWO)} else PITCH_ONE
 
 
 def serialize_team(team: dict[str, Any]) -> dict[str, Any]:
@@ -646,7 +750,9 @@ def serialize_team(team: dict[str, Any]) -> dict[str, Any]:
         "schedule_time": team.get("schedule_time"),
         "manual_position": team.get("manual_position"),
         "evaluation_count": team["evaluation_count"],
+        "active_evaluation_count": team.get("active_evaluation_count", team["evaluation_count"]),
         "no_show_count": team.get("no_show_count", 0),
+        "deactivated": team.get("deactivated", False),
         "average_5": team["average_5"],
         "average_100": team["average_100"],
         "rubric_averages": team["rubric_averages"],
@@ -655,8 +761,8 @@ def serialize_team(team: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def get_team_detail(conn: sqlite3.Connection, team_id: int) -> dict[str, Any] | None:
-    ranking, stats_by_id, _, juror_count = compute_team_stats(conn)
+def get_team_detail(conn: sqlite3.Connection, team_id: int, pitch_id: int = PITCH_ONE, team_ids: set[int] | None = None) -> dict[str, Any] | None:
+    ranking, stats_by_id, _, juror_count = compute_team_stats(conn, pitch_id, team_ids)
     team = stats_by_id.get(team_id)
     if team is None:
         return None
@@ -665,10 +771,10 @@ def get_team_detail(conn: sqlite3.Connection, team_id: int) -> dict[str, Any] | 
         SELECT rh.position, rh.score_5, rh.score_100, rh.recorded_at, e.updated_at AS evaluation_updated_at
         FROM ranking_history rh
         LEFT JOIN evaluations e ON e.id = rh.evaluation_id
-        WHERE rh.team_id = ?
+        WHERE rh.team_id = ? AND rh.pitch_id = ?
         ORDER BY rh.recorded_at ASC, rh.id ASC
         """,
-        (team_id,),
+        (team_id, pitch_id),
     ).fetchall()
     team_history = [
         {
@@ -683,7 +789,7 @@ def get_team_detail(conn: sqlite3.Connection, team_id: int) -> dict[str, Any] | 
     juror_progress = {
         "total_jurors": juror_count,
         "evaluations_count": team["evaluation_count"],
-        "pending_count": max(juror_count - team["evaluation_count"], 0),
+        "pending_count": max(juror_count - team["active_evaluation_count"], 0),
         "status": team["status"],
     }
     evaluations = team["evaluations"]
@@ -696,97 +802,67 @@ def get_team_detail(conn: sqlite3.Connection, team_id: int) -> dict[str, Any] | 
     }
 
 
-def get_evaluated_team_ids(conn: sqlite3.Connection, juror_id: int) -> set[int]:
-    rows = conn.execute("SELECT team_id FROM evaluations WHERE juror_id = ?", (juror_id,)).fetchall()
+def get_evaluated_team_ids(conn: sqlite3.Connection, juror_id: int, pitch_id: int = PITCH_ONE) -> set[int]:
+    rows = conn.execute("SELECT team_id FROM evaluations WHERE juror_id = ? AND pitch_id = ?", (juror_id, pitch_id)).fetchall()
     return {row["team_id"] for row in rows}
 
 
-def get_juror_no_show_ids(conn: sqlite3.Connection, juror_id: int) -> set[int]:
-    rows = conn.execute("SELECT team_id FROM no_shows WHERE juror_id = ?", (juror_id,)).fetchall()
-    return {row["team_id"] for row in rows}
+def get_pitch_team_settings(conn: sqlite3.Connection, pitch_id: int) -> dict[int, dict[str, Any]]:
+    """Orden de presentación y estado (activo/desactivado) que el admin
+    configuró para cada equipo dentro de un Pitch."""
+    cache = request_cache(conn)
+    cache_key = ("pitch_settings", pitch_id)
+    if cache_key not in cache:
+        rows = conn.execute(
+            "SELECT team_id, sort_order, deactivated FROM pitch_team_settings WHERE pitch_id = ?",
+            (pitch_id,),
+        ).fetchall()
+        cache[cache_key] = {
+            row["team_id"]: {"sort_order": row["sort_order"], "deactivated": bool(row["deactivated"])}
+            for row in rows
+        }
+    return cache[cache_key]
 
 
-def move_team_to_end_of_its_day(conn: sqlite3.Connection, team_id: int) -> None:
-    """Mueve un equipo al final de la fila de SU día (19 o 20 de agosto),
-    sin tocar el orden de presentación del otro día. Si el equipo no tiene
-    día asignado, cae al final de toda la lista (comportamiento anterior)."""
-    team = conn.execute(
-        "SELECT id, display_order, schedule_day FROM teams WHERE id = ?", (team_id,)
-    ).fetchone()
-    if team is None:
+def get_pitch_presentation_rows(
+    conn: sqlite3.Connection,
+    pitch_id: int,
+    team_ids: set[int] | None,
+    include_deactivated: bool = False,
+) -> list[sqlite3.Row]:
+    """Equipos del Pitch en el orden en que los ven los jurados. Los equipos
+    sin orden manual van después de los ordenados, según display_order."""
+    rows = get_all_teams(conn)
+    if team_ids is not None:
+        rows = [row for row in rows if row["id"] in team_ids]
+    settings = get_pitch_team_settings(conn, pitch_id)
+    if not include_deactivated:
+        rows = [row for row in rows if not settings.get(row["id"], {}).get("deactivated")]
+
+    def sort_key(row: sqlite3.Row) -> tuple:
+        sort_order = settings.get(row["id"], {}).get("sort_order")
+        return (sort_order is None, sort_order or 0, row["display_order"], row["id"])
+
+    return sorted(rows, key=sort_key)
+
+
+def save_pitch_presentation_order(conn: sqlite3.Connection, pitch_id: int, ordered_ids: list[int]) -> None:
+    if not ordered_ids:
         return
-    old_order = team["display_order"]
-    day = team["schedule_day"]
-
-    if day:
-        max_order = conn.execute(
-            "SELECT MAX(display_order) FROM teams WHERE schedule_day = ?", (day,)
-        ).fetchone()[0]
-    else:
-        max_order = conn.execute("SELECT MAX(display_order) FROM teams").fetchone()[0]
-
-    if max_order is None or old_order >= max_order:
-        return  # ya está al final de su día (o de la lista)
-
-    # PostgreSQL puede validar la restricción UNIQUE(display_order) FILA POR FILA
-    # dentro de un mismo UPDATE, no solo al terminar el statement. Si movemos de
-    # golpe un rango completo con "display_order - 1", el orden interno en que
-    # Postgres visite esas filas puede hacer que, transitoriamente, dos filas
-    # queden con el mismo valor -> UniqueViolation (esto es justo lo que pasó).
-    # Para evitarlo del todo, cada paso de abajo es una simple traslación
-    # aritmética (sumar/restar la MISMA constante a todas las filas afectadas),
-    # que por definición nunca puede hacer que dos valores distintos terminen
-    # siendo iguales, sin importar en qué orden Postgres procese las filas.
-    HOLDING_OFFSET = 1_000_000_000
-    HOLDING_THRESHOLD = -500_000_000
-
-    # 1) Sacar al equipo del medio de la fila (valor negativo único: no puede
-    #    chocar con ningún display_order real).
-    conn.execute("UPDATE teams SET display_order = -id WHERE id = ?", (team_id,))
-
-    # 2) Mandar el resto de la fila (los que quedaban después de este equipo)
-    #    a una zona "de espera" muy alejada de cualquier valor real.
-    if day:
-        conn.execute(
-            "UPDATE teams SET display_order = display_order - ? "
-            "WHERE schedule_day = ? AND display_order > ?",
-            (HOLDING_OFFSET, day, old_order),
-        )
-    else:
-        conn.execute(
-            "UPDATE teams SET display_order = display_order - ? WHERE display_order > ?",
-            (HOLDING_OFFSET, old_order),
-        )
-
-    # 3) Traerlos de vuelta, ahora un puesto más arriba que antes.
-    if day:
-        conn.execute(
-            "UPDATE teams SET display_order = display_order + ? "
-            "WHERE schedule_day = ? AND display_order < ?",
-            (HOLDING_OFFSET - 1, day, HOLDING_THRESHOLD),
-        )
-    else:
-        conn.execute(
-            "UPDATE teams SET display_order = display_order + ? WHERE display_order < ?",
-            (HOLDING_OFFSET - 1, HOLDING_THRESHOLD),
-        )
-
-    # 4) Ubicar al equipo al final de su día.
-    conn.execute("UPDATE teams SET display_order = ? WHERE id = ?", (max_order, team_id))
+    conn.execute(
+        "INSERT INTO pitch_team_settings (pitch_id, team_id, sort_order) "
+        "SELECT ?, t.team_id, t.sort_order FROM unnest(?::bigint[], ?::integer[]) AS t(team_id, sort_order) "
+        "ON CONFLICT (pitch_id, team_id) DO UPDATE SET sort_order = EXCLUDED.sort_order",
+        (pitch_id, ordered_ids, list(range(1, len(ordered_ids) + 1))),
+    )
 
 
-GEMINI_MODEL = "gemini-2.5-flash"
-GEMINI_API_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
-GEMINI_SYSTEM_INSTRUCTION = (
-    "Eres un asistente de edición para jurados de proyectos. Tu única tarea es corregir la "
-    "ortografía, mejorar la gramática y dar un tono profesional y constructivo al texto "
-    "proporcionado.\n"
-    "REGLAS ESTRICTAS:\n"
-    "- Conserva exactamente la misma intención, aspectos positivos y críticas del texto original.\n"
-    "- NO agregues información, elogios ni críticas que el usuario no haya escrito.\n"
-    "- Sé breve y directo (máximo 2 a 3 oraciones).\n"
-    "- Devuelve ÚNICAMENTE el texto mejorado en texto plano, sin introducciones ni comillas."
-)
+def set_pitch_team_deactivated(conn: sqlite3.Connection, pitch_id: int, team_id: int, deactivated: bool) -> None:
+    conn.execute(
+        "INSERT INTO pitch_team_settings (pitch_id, team_id, deactivated) VALUES (?, ?, ?) "
+        "ON CONFLICT (pitch_id, team_id) DO UPDATE SET deactivated = EXCLUDED.deactivated",
+        (pitch_id, team_id, 1 if deactivated else 0),
+    )
 
 
 def _call_gemini_once(api_key: str, original_text: str) -> str:
@@ -875,33 +951,14 @@ def get_next_pending_team_id(
     juror_id: int,
     team_rows: list[sqlite3.Row],
     after_team_id: int | None = None,
+    pitch_id: int = PITCH_ONE,
 ) -> int | None:
-    """Return the next team (in display order) this juror should evaluate.
-
-    Teams the juror has already evaluated are always skipped. Teams this
-    juror personally marked as 'No asistió' are deprioritized: skipped as
-    long as there's another pending team left *on the same schedule day*,
-    but once that day is otherwise finished they resurface (so the juror
-    reaches them last within that day, matching where 'No asistió' visually
-    moved them via move_team_to_end_of_its_day). They don't get pushed past
-    a day boundary just because the *other* day still has pending teams."""
+    """Return the next team (in the admin's presentation order) this juror
+    should evaluate, skipping teams the juror has already evaluated."""
     if not team_rows:
         return None
-    evaluated_ids = get_evaluated_team_ids(conn, juror_id)
-    deprioritized_ids = get_juror_no_show_ids(conn, juror_id) - evaluated_ids
+    evaluated_ids = get_evaluated_team_ids(conn, juror_id, pitch_id)
     ids = [row["id"] for row in team_rows]
-    day_by_id = {row["id"]: row["schedule_day"] for row in team_rows}
-
-    # Count, per schedule day, how many teams are still pending for this
-    # juror *and not deprioritized*. A deprioritized team only needs to wait
-    # for its own day's pending count to hit zero, not the whole list's.
-    pending_per_day: dict[Any, int] = {}
-    for row in team_rows:
-        tid = row["id"]
-        if tid in evaluated_ids or tid in deprioritized_ids:
-            continue
-        day = row["schedule_day"]
-        pending_per_day[day] = pending_per_day.get(day, 0) + 1
 
     start_index = 0
     if after_team_id is not None and after_team_id in ids:
@@ -912,28 +969,65 @@ def get_next_pending_team_id(
         candidate = ids[idx]
         if candidate in evaluated_ids:
             continue
-        if candidate in deprioritized_ids and pending_per_day.get(day_by_id[candidate], 0) > 0:
-            continue
         return candidate
-    return after_team_id if after_team_id is not None else ids[0]
+    return None
 
 
-def get_jury_dashboard(conn: sqlite3.Connection, juror_id: int, team_id: int | None = None) -> dict[str, Any]:
-    ranking, stats_by_id, _, juror_count = compute_team_stats(conn)
-    team_rows = conn.execute("SELECT * FROM teams ORDER BY display_order ASC, id ASC").fetchall()
+def get_pitch_team_ids(conn: sqlite3.Connection, pitch_id: int) -> set[int] | None:
+    if pitch_id == PITCH_ONE:
+        return None
+    if pitch_id == PITCH_TWO:
+        ranking, _, _, _ = compute_team_stats(conn, PITCH_ONE)
+        return {team["id"] for team in ranking[:WINNERS_COUNT]}
+    return set()
+
+
+def winners_count_for_pitch(pitch_id: int) -> int:
+    """Cuántos equipos clasifican en cada Pitch: del Pitch 1 pasan 20 al
+    Pitch 2, y del Pitch 2 salen los 10 finalistas."""
+    return FINALISTS_COUNT if pitch_id == PITCH_TWO else WINNERS_COUNT
+
+
+def get_active_pitch(conn: sqlite3.Connection) -> int:
+    row = conn.execute(
+        "SELECT value FROM app_settings WHERE key = ?", (ACTIVE_PITCH_SETTING_KEY,)
+    ).fetchone()
+    if row is None:
+        return PITCH_ONE
+    try:
+        value = int(row["value"])
+    except (TypeError, ValueError):
+        return PITCH_ONE
+    return value if value in (PITCH_ONE, PITCH_TWO, PITCH_THREE) else PITCH_ONE
+
+
+def set_active_pitch(conn: sqlite3.Connection, pitch_id: int) -> None:
+    conn.execute(
+        "INSERT INTO app_settings (key, value) VALUES (?, ?) "
+        "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+        (ACTIVE_PITCH_SETTING_KEY, str(pitch_id)),
+    )
+
+
+def get_jury_dashboard(conn: sqlite3.Connection, juror_id: int, team_id: int | None = None, pitch_id: int = PITCH_ONE) -> dict[str, Any]:
+    team_ids = get_pitch_team_ids(conn, pitch_id)
+    ranking, stats_by_id, _, juror_count = compute_team_stats(conn, pitch_id, team_ids)
+    team_rows = get_pitch_presentation_rows(conn, pitch_id, team_ids)
     team_summary = [serialize_team(stats_by_id[row["id"]]) for row in team_rows]
+    if team_id is not None and team_id not in {row["id"] for row in team_rows}:
+        team_id = None
     if team_id is None:
-        team_id = get_next_pending_team_id(conn, juror_id, team_rows)
-    team_detail = get_team_detail(conn, team_id) if team_id is not None else None
+        team_id = get_next_pending_team_id(conn, juror_id, team_rows, pitch_id=pitch_id)
+    team_detail = get_team_detail(conn, team_id, pitch_id, team_ids) if team_id is not None else None
     current_eval = None
     if team_id is not None:
         current_eval_row = conn.execute(
             """
             SELECT *
             FROM evaluations
-            WHERE team_id = ? AND juror_id = ?
+            WHERE team_id = ? AND juror_id = ? AND pitch_id = ?
             """,
-            (team_id, juror_id),
+            (team_id, juror_id, pitch_id),
         ).fetchone()
         if current_eval_row is not None:
             current_eval = {
@@ -951,23 +1045,14 @@ def get_jury_dashboard(conn: sqlite3.Connection, juror_id: int, team_id: int | N
                 "created_at": current_eval_row["created_at"],
                 "updated_at": current_eval_row["updated_at"],
             }
-    completed_count = conn.execute(
-        "SELECT COUNT(*) FROM evaluations WHERE juror_id = ?",
-        (juror_id,),
-    ).fetchone()[0]
+    visible_ids = {row["id"] for row in team_rows}
+    completed_count = len(get_evaluated_team_ids(conn, juror_id, pitch_id) & visible_ids)
     current_index = 0
     if team_id is not None:
         for index, row in enumerate(team_rows):
             if row["id"] == team_id:
                 current_index = index
                 break
-    ai_improvement_used = False
-    if team_id is not None:
-        ai_row = conn.execute(
-            "SELECT 1 FROM ai_improvements WHERE team_id = ? AND juror_id = ?",
-            (team_id, juror_id),
-        ).fetchone()
-        ai_improvement_used = ai_row is not None
     return {
         "teams": team_summary,
         "current_team_id": team_id,
@@ -975,7 +1060,6 @@ def get_jury_dashboard(conn: sqlite3.Connection, juror_id: int, team_id: int | N
         "current_team": team_detail["team"] if team_detail else None,
         "current_team_detail": team_detail,
         "current_evaluation": current_eval,
-        "ai_improvement_used": ai_improvement_used,
         "progress": {
             "assigned": len(team_rows),
             "completed": completed_count,
@@ -984,6 +1068,7 @@ def get_jury_dashboard(conn: sqlite3.Connection, juror_id: int, team_id: int | N
         },
         "ranking": ranking,
         "juror_count": juror_count,
+        "pitch_id": pitch_id,
     }
 
 
@@ -1290,24 +1375,49 @@ def send_pdf(handler: SimpleHTTPRequestHandler, data: bytes, filename: str) -> N
     handler.wfile.write(data)
 
 
-def get_admin_dashboard(conn: sqlite3.Connection, selected_team_id: int | None = None) -> dict[str, Any]:
-    ranking, stats_by_id, _, juror_count = compute_team_stats(conn)
+def get_admin_dashboard(conn: sqlite3.Connection, selected_team_id: int | None = None, pitch_id: int = PITCH_ONE) -> dict[str, Any]:
+    team_ids = get_pitch_team_ids(conn, pitch_id)
+    ranking, stats_by_id, _, juror_count = compute_team_stats(conn, pitch_id, team_ids)
     if selected_team_id is None and ranking:
         selected_team_id = ranking[0]["id"]
-    team_detail = get_team_detail(conn, selected_team_id) if selected_team_id is not None else None
+    team_detail = get_team_detail(conn, selected_team_id, pitch_id, team_ids) if selected_team_id is not None else None
     jurors = [serialize_user(user) for user in conn.execute("SELECT * FROM users WHERE role = ? ORDER BY name ASC", (ROLE_JURY,)).fetchall()]
+    counts_by_juror: dict[int, dict[str, int]] = defaultdict(dict)
+    for row in conn.execute("SELECT juror_id, pitch_id, COUNT(*) AS cnt FROM evaluations GROUP BY juror_id, pitch_id").fetchall():
+        counts_by_juror[row["juror_id"]][str(row["pitch_id"])] = row["cnt"]
+    for juror in jurors:
+        juror["evaluations_by_pitch"] = counts_by_juror.get(juror["id"], {})
     admins = [serialize_user(user) for user in conn.execute("SELECT * FROM users WHERE role = ? ORDER BY name ASC", (ROLE_ADMIN,)).fetchall()]
+    presentation_rows = get_pitch_presentation_rows(conn, pitch_id, team_ids, include_deactivated=True)
+    presentation = [
+        {
+            "id": row["id"],
+            "name": row["name"],
+            "schedule_day": row["schedule_day"],
+            "schedule_time": row["schedule_time"],
+            "evaluation_count": stats_by_id[row["id"]]["evaluation_count"],
+            "active_evaluation_count": stats_by_id[row["id"]]["active_evaluation_count"],
+            "status": stats_by_id[row["id"]]["status"],
+            "deactivated": stats_by_id[row["id"]]["deactivated"],
+        }
+        for row in presentation_rows
+    ]
+    active_ranking = [item for item in ranking if not item["deactivated"]]
     return {
         "ranking": ranking,
         "selected_team": team_detail,
         "jurors": jurors,
         "admins": admins,
+        "presentation": presentation,
         "summary": {
-            "teams": len(ranking),
-            "evaluated": len([item for item in ranking if item["evaluation_count"] > 0]),
-            "pending": len([item for item in ranking if item["evaluation_count"] == 0]),
+            "teams": len(active_ranking),
+            "evaluated": len([item for item in active_ranking if item["evaluation_count"] > 0]),
+            "pending": len([item for item in active_ranking if item["evaluation_count"] == 0]),
             "jurors": juror_count,
         },
+        "pitch_id": pitch_id,
+        "active_pitch": get_active_pitch(conn),
+        "winners_count": winners_count_for_pitch(pitch_id),
     }
 
 
@@ -1326,7 +1436,7 @@ def validate_scores(payload: dict[str, Any]) -> tuple[dict[str, float], str | No
     return scores, None
 
 
-def store_evaluation(conn: sqlite3.Connection, team_id: int, juror_id: int, payload: dict[str, Any]) -> dict[str, Any]:
+def store_evaluation(conn: sqlite3.Connection, team_id: int, juror_id: int, payload: dict[str, Any], pitch_id: int = PITCH_ONE) -> dict[str, Any]:
     scores, error = validate_scores(payload)
     if error:
         raise ValueError(error)
@@ -1344,18 +1454,19 @@ def store_evaluation(conn: sqlite3.Connection, team_id: int, juror_id: int, payl
     final_score_100 = round(final_score_5 * 20, 4)
     timestamp = iso_now()
     existing = conn.execute(
-        "SELECT id, created_at FROM evaluations WHERE team_id = ? AND juror_id = ?",
-        (team_id, juror_id),
+        "SELECT id, created_at FROM evaluations WHERE team_id = ? AND juror_id = ? AND pitch_id = ?",
+        (team_id, juror_id, pitch_id),
     ).fetchone()
     if existing is None:
         cursor = conn.execute(
             """
             INSERT INTO evaluations (
-                team_id, juror_id, problem_score, value_score, validation_score, business_score,
+                pitch_id, team_id, juror_id, problem_score, value_score, validation_score, business_score,
                 pitch_score, observations, final_score_5, final_score_100, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
+                pitch_id,
                 team_id,
                 juror_id,
                 scores["problem_score"],
@@ -1393,16 +1504,16 @@ def store_evaluation(conn: sqlite3.Connection, team_id: int, juror_id: int, payl
                 evaluation_id,
             ),
         )
-    record_ranking_history(conn, evaluation_id)
+    record_ranking_history(conn, pitch_id, evaluation_id, get_pitch_team_ids(conn, pitch_id))
     conn.commit()
     saved = conn.execute(
         """
         SELECT e.*, u.name AS juror_name, u.identifier AS juror_identifier
         FROM evaluations e
         INNER JOIN users u ON u.id = e.juror_id
-        WHERE e.team_id = ? AND e.juror_id = ?
+        WHERE e.team_id = ? AND e.juror_id = ? AND e.pitch_id = ?
         """,
-        (team_id, juror_id),
+        (team_id, juror_id, pitch_id),
     ).fetchone()
     return {
         "id": saved["id"],
@@ -1427,7 +1538,7 @@ class InnovatePitchHandler(SimpleHTTPRequestHandler):
     server_version = "InnovatePitch/1.0"
 
     def __init__(self, *args: Any, directory: str | None = None, **kwargs: Any) -> None:
-        super().__init__(*args, directory=str(ROOT), **kwargs)
+        super().__init__(*args, directory=str(FRONTEND_DIR), **kwargs)
 
     def log_message(self, format: str, *args: Any) -> None:
         return
@@ -1477,11 +1588,14 @@ class InnovatePitchHandler(SimpleHTTPRequestHandler):
         if parsed.path == "/api/logout":
             self.handle_logout()
             return
-        if parsed.path.startswith("/api/jury/team/") and parsed.path.rstrip("/").endswith("/no-show"):
-            self.handle_jury_no_show(parsed)
+        if parsed.path.startswith("/api/admin/jurors/") and parsed.path.rstrip("/").endswith(("/activate", "/deactivate")):
+            self.handle_admin_juror_set_active(parsed)
             return
-        if parsed.path.startswith("/api/jury/team/") and parsed.path.rstrip("/").endswith("/improve-observations"):
-            self.handle_jury_improve_observations(parsed)
+        if parsed.path.startswith("/api/admin/team/") and parsed.path.rstrip("/").endswith("/move-to-end"):
+            self.handle_admin_team_move_to_end(parsed)
+            return
+        if parsed.path.startswith("/api/admin/team/") and parsed.path.rstrip("/").endswith(("/deactivate", "/reactivate")):
+            self.handle_admin_team_set_active(parsed)
             return
         send_error_json(self, HTTPStatus.NOT_FOUND, "Ruta no encontrada.")
 
@@ -1490,16 +1604,18 @@ class InnovatePitchHandler(SimpleHTTPRequestHandler):
         if parsed.path == "/api/admin/ranking":
             self.handle_save_ranking(parsed)
             return
+        if parsed.path == "/api/admin/active-pitch":
+            self.handle_set_active_pitch(parsed)
+            return
+        if parsed.path == "/api/admin/presentation-order":
+            self.handle_save_presentation_order(parsed)
+            return
         if parsed.path.startswith("/api/jury/evaluation/"):
             self.handle_save_evaluation(parsed)
             return
         send_error_json(self, HTTPStatus.NOT_FOUND, "Ruta no encontrada.")
 
     def do_DELETE(self) -> None:
-        parsed = urlparse(self.path)
-        if parsed.path == "/api/admin/reset-evaluations":
-            self.handle_reset_evaluations()
-            return
         send_error_json(self, HTTPStatus.NOT_FOUND, "Ruta no encontrada.")
 
     def handle_bootstrap(self) -> None:
@@ -1516,7 +1632,7 @@ class InnovatePitchHandler(SimpleHTTPRequestHandler):
             if user["role"] == ROLE_ADMIN:
                 payload["dashboard"] = get_admin_dashboard(conn)
             else:
-                payload["dashboard"] = get_jury_dashboard(conn, user["id"])
+                payload["dashboard"] = get_jury_dashboard(conn, user["id"], None, get_active_pitch(conn))
             send_json(self, payload)
 
     def handle_login(self) -> None:
@@ -1556,15 +1672,45 @@ class InnovatePitchHandler(SimpleHTTPRequestHandler):
         expired_cookie = f"{SESSION_COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0"
         send_json(self, {"ok": True}, extra_headers={"Set-Cookie": expired_cookie})
 
+    def handle_set_active_pitch(self, parsed) -> None:
+        user = require_user(self, ROLE_ADMIN)
+        if user is None:
+            return
+        try:
+            payload = load_json(self)
+        except Exception:
+            send_error_json(self, HTTPStatus.BAD_REQUEST, "El cuerpo de la solicitud no es válido.")
+            return
+        try:
+            pitch_id = int(payload.get("pitch"))
+        except (TypeError, ValueError):
+            send_error_json(self, HTTPStatus.BAD_REQUEST, "Debe indicar un pitch válido.")
+            return
+        if pitch_id not in (PITCH_ONE, PITCH_TWO, PITCH_THREE):
+            send_error_json(self, HTTPStatus.BAD_REQUEST, "El pitch debe ser 1, 2 o 3.")
+            return
+        with db_connect() as conn:
+            set_active_pitch(conn, pitch_id)
+            conn.commit()
+        send_json(
+            self,
+            {
+                "ok": True,
+                "message": f"El Pitch {pitch_id} ahora está activo para los jurados.",
+                "active_pitch": pitch_id,
+            },
+        )
+
     def handle_admin_dashboard(self, parsed) -> None:
         user = require_user(self, ROLE_ADMIN)
         if user is None:
             return
         params = parse_qs(parsed.query)
+        pitch_id = parse_pitch_id(params)
         team_id = params.get("team_id", [None])[0]
         team_id_int = int(team_id) if team_id and str(team_id).isdigit() else None
         with db_connect() as conn:
-            send_json(self, {"ok": True, "user": serialize_user(user), "dashboard": get_admin_dashboard(conn, team_id_int)})
+            send_json(self, {"ok": True, "user": serialize_user(user), "dashboard": get_admin_dashboard(conn, team_id_int, pitch_id)})
 
     def handle_admin_team(self, parsed) -> None:
         user = require_user(self, ROLE_ADMIN)
@@ -1574,8 +1720,10 @@ class InnovatePitchHandler(SimpleHTTPRequestHandler):
         if not team_id_text.isdigit():
             send_error_json(self, HTTPStatus.BAD_REQUEST, "Equipo inválido.")
             return
+        pitch_id = parse_pitch_id(parse_qs(urlparse(self.path).query))
         with db_connect() as conn:
-            detail = get_team_detail(conn, int(team_id_text))
+            team_ids = get_pitch_team_ids(conn, pitch_id)
+            detail = get_team_detail(conn, int(team_id_text), pitch_id, team_ids)
             if detail is None:
                 send_error_json(self, HTTPStatus.NOT_FOUND, "Equipo no encontrado.")
                 return
@@ -1585,11 +1733,15 @@ class InnovatePitchHandler(SimpleHTTPRequestHandler):
         user = require_user(self, ROLE_ADMIN)
         if user is None:
             return
+        pitch_id = parse_pitch_id(parse_qs(parsed.query))
         with db_connect() as conn:
             team_rows = conn.execute("SELECT id FROM teams ORDER BY display_order ASC, id ASC").fetchall()
+            team_ids = get_pitch_team_ids(conn, pitch_id)
+            if team_ids is not None:
+                team_rows = [row for row in team_rows if row["id"] in team_ids]
             teams = []
             for row in team_rows:
-                detail = get_team_detail(conn, row["id"])
+                detail = get_team_detail(conn, row["id"], pitch_id, team_ids)
                 if detail is not None:
                     teams.append({"name": detail["team"]["name"], "evaluations": detail["evaluations"]})
         pdf_bytes = build_all_teams_observations_pdf(teams)
@@ -1599,10 +1751,13 @@ class InnovatePitchHandler(SimpleHTTPRequestHandler):
         user = require_user(self, ROLE_ADMIN)
         if user is None:
             return
+        pitch_id = parse_pitch_id(parse_qs(parsed.query))
         with db_connect() as conn:
-            ranking, _, _, _ = compute_team_stats(conn)
+            team_ids = get_pitch_team_ids(conn, pitch_id)
+            ranking, _, _, _ = compute_team_stats(conn, pitch_id, team_ids)
 
-        top_teams = ranking[:WINNERS_COUNT]
+        winners_count = winners_count_for_pitch(pitch_id)
+        top_teams = ranking[:winners_count]
         headers = [
             "Posición",
             "Equipo",
@@ -1641,12 +1796,16 @@ class InnovatePitchHandler(SimpleHTTPRequestHandler):
                     ]
                 )
 
-        xlsx_bytes = build_xlsx(headers, rows, sheet_name=f"Ganadores Top {WINNERS_COUNT}")
-        send_xlsx(self, xlsx_bytes, f"ganadores_top{WINNERS_COUNT}.xlsx")
+        xlsx_bytes = build_xlsx(headers, rows, sheet_name=f"Ganadores Top {winners_count}")
+        send_xlsx(self, xlsx_bytes, f"ganadores_pitch{pitch_id}_top{winners_count}.xlsx")
 
     def handle_save_ranking(self, parsed) -> None:
         user = require_user(self, ROLE_ADMIN)
         if user is None:
+            return
+        pitch_id = parse_pitch_id(parse_qs(parsed.query))
+        if pitch_id != PITCH_ONE:
+            send_error_json(self, HTTPStatus.FORBIDDEN, "La deliberación solo está disponible para el Pitch 1.")
             return
         try:
             payload = load_json(self)
@@ -1673,54 +1832,6 @@ class InnovatePitchHandler(SimpleHTTPRequestHandler):
             dashboard = get_admin_dashboard(conn)
         send_json(self, {"ok": True, "message": "Deliberación guardada. El ranking quedó fijado en el orden elegido.", "dashboard": dashboard})
 
-    def handle_reset_evaluations(self) -> None:
-        user = require_user(self, ROLE_ADMIN)
-        if user is None:
-            return
-        if user["identifier"].lower() != SUPER_ADMIN_IDENTIFIER.lower():
-            send_error_json(
-                self,
-                HTTPStatus.FORBIDDEN,
-                "Solo Karly Velasquez puede reiniciar las calificaciones.",
-            )
-            return
-        with db_connect() as conn:
-            conn.execute("DELETE FROM evaluations")
-            conn.execute("DELETE FROM ranking_history")
-            conn.execute("DELETE FROM no_shows")
-            conn.execute("DELETE FROM ai_improvements")
-            conn.execute("UPDATE teams SET manual_position = NULL")
-            # display_order has a UNIQUE constraint. If any team's current
-            # display_order was shuffled by a "No asistió" consensus move,
-            # restoring everyone straight to original_order in a single
-            # UPDATE can transiently collide two rows on the same value
-            # while PostgreSQL processes the statement row by row, raising
-            # a UniqueViolation (500). Stage through a temporary negative
-            # offset first (guaranteed not to collide with any real,
-            # positive display_order) so the final UPDATE never has two
-            # rows sharing a value at any point.
-            RESET_HOLDING_OFFSET = 1_000_000_000
-            conn.execute(
-                "UPDATE teams SET display_order = -display_order - ?",
-                (RESET_HOLDING_OFFSET,),
-            )
-            conn.execute(
-                "UPDATE teams SET display_order = COALESCE(original_order, -display_order - ?)",
-                (RESET_HOLDING_OFFSET,),
-            )
-            conn.commit()
-            record_ranking_history(conn, None)
-            conn.commit()
-            dashboard = get_admin_dashboard(conn)
-        send_json(
-            self,
-            {
-                "ok": True,
-                "message": "Todas las calificaciones fueron eliminadas. El sistema quedó como si ningún jurado hubiera votado.",
-                "dashboard": dashboard,
-            },
-        )
-
     def handle_jury_dashboard(self, parsed) -> None:
         user = require_user(self, ROLE_JURY)
         if user is None:
@@ -1729,7 +1840,8 @@ class InnovatePitchHandler(SimpleHTTPRequestHandler):
         team_id = params.get("team_id", [None])[0]
         team_id_int = int(team_id) if team_id and str(team_id).isdigit() else None
         with db_connect() as conn:
-            send_json(self, {"ok": True, "user": serialize_user(user), "dashboard": get_jury_dashboard(conn, user["id"], team_id_int)})
+            pitch_id = get_active_pitch(conn)
+            send_json(self, {"ok": True, "user": serialize_user(user), "dashboard": get_jury_dashboard(conn, user["id"], team_id_int, pitch_id)})
 
     def handle_jury_team(self, parsed) -> None:
         user = require_user(self, ROLE_JURY)
@@ -1740,13 +1852,15 @@ class InnovatePitchHandler(SimpleHTTPRequestHandler):
             send_error_json(self, HTTPStatus.BAD_REQUEST, "Equipo inválido.")
             return
         with db_connect() as conn:
-            detail = get_team_detail(conn, int(team_id_text))
-            if detail is None:
+            pitch_id = get_active_pitch(conn)
+            team_ids = get_pitch_team_ids(conn, pitch_id)
+            detail = get_team_detail(conn, int(team_id_text), pitch_id, team_ids)
+            if detail is None or detail["team"]["deactivated"]:
                 send_error_json(self, HTTPStatus.NOT_FOUND, "Equipo no encontrado.")
                 return
             current = conn.execute(
-                "SELECT * FROM evaluations WHERE team_id = ? AND juror_id = ?",
-                (int(team_id_text), user["id"]),
+                "SELECT * FROM evaluations WHERE team_id = ? AND juror_id = ? AND pitch_id = ?",
+                (int(team_id_text), user["id"], pitch_id),
             ).fetchone()
             evaluation = None
             if current is not None:
@@ -1767,101 +1881,114 @@ class InnovatePitchHandler(SimpleHTTPRequestHandler):
                 }
             send_json(self, {"ok": True, "team": detail, "evaluation": evaluation})
 
-    def handle_jury_no_show(self, parsed) -> None:
-        user = require_user(self, ROLE_JURY)
+    def handle_save_presentation_order(self, parsed) -> None:
+        user = require_user(self, ROLE_ADMIN)
         if user is None:
             return
-        parts = [part for part in parsed.path.split("/") if part]
-        # parts look like: ['api', 'jury', 'team', '<id>', 'no-show']
-        if len(parts) < 5 or not parts[3].isdigit():
-            send_error_json(self, HTTPStatus.BAD_REQUEST, "Equipo inválido.")
-            return
-        team_id = int(parts[3])
-        with db_connect() as conn:
-            team = conn.execute("SELECT id FROM teams WHERE id = ?", (team_id,)).fetchone()
-            if team is None:
-                send_error_json(self, HTTPStatus.NOT_FOUND, "Equipo no encontrado.")
-                return
-            conn.execute(
-                "INSERT OR IGNORE INTO no_shows (team_id, juror_id) VALUES (?, ?)",
-                (team_id, user["id"]),
-            )
-            conn.commit()
-
-            active_juror_count = conn.execute(
-                "SELECT COUNT(*) FROM users WHERE role = ? AND active = 1",
-                (ROLE_JURY,),
-            ).fetchone()[0]
-            no_show_count = conn.execute(
-                "SELECT COUNT(*) FROM no_shows WHERE team_id = ?",
-                (team_id,),
-            ).fetchone()[0]
-            consensus = active_juror_count > 0 and no_show_count >= active_juror_count
-
-            if consensus:
-                move_team_to_end_of_its_day(conn, team_id)
-                conn.commit()
-
-            dashboard = get_jury_dashboard(conn, user["id"], None)
-
-        if consensus:
-            message = "Todos los jurados marcaron este equipo como 'No asistió'. Se movió al final de la fila de su día."
-        else:
-            message = f"Marcaste este equipo como 'No asistió' ({no_show_count}/{active_juror_count} jurados). Continuando con el siguiente equipo pendiente."
-        send_json(self, {"ok": True, "message": message, "dashboard": dashboard})
-
-    def handle_jury_improve_observations(self, parsed) -> None:
-        user = require_user(self, ROLE_JURY)
-        if user is None:
-            return
-        parts = [part for part in parsed.path.split("/") if part]
-        # parts look like: ['api', 'jury', 'team', '<id>', 'improve-observations']
-        if len(parts) < 5 or not parts[3].isdigit():
-            send_error_json(self, HTTPStatus.BAD_REQUEST, "Equipo inválido.")
-            return
-        team_id = int(parts[3])
-
+        pitch_id = parse_pitch_id(parse_qs(parsed.query))
         try:
             payload = load_json(self)
+            order_ids = [int(team_id) for team_id in payload.get("order") or []]
         except Exception:
-            send_error_json(self, HTTPStatus.BAD_REQUEST, "El cuerpo de la solicitud no es válido.")
+            send_error_json(self, HTTPStatus.BAD_REQUEST, "El orden de equipos es inválido.")
             return
-        original_text = str(payload.get("texto_original", "")).strip()
-        if not original_text:
-            send_error_json(self, HTTPStatus.BAD_REQUEST, "Escribe una observación antes de mejorarla con IA.")
+        if not order_ids or len(order_ids) != len(set(order_ids)):
+            send_error_json(self, HTTPStatus.BAD_REQUEST, "El orden debe incluir cada equipo una sola vez.")
             return
-
         with db_connect() as conn:
-            team = conn.execute("SELECT id FROM teams WHERE id = ?", (team_id,)).fetchone()
-            if team is None:
-                send_error_json(self, HTTPStatus.NOT_FOUND, "Equipo no encontrado.")
+            team_ids = get_pitch_team_ids(conn, pitch_id)
+            current_ids = [row["id"] for row in get_pitch_presentation_rows(conn, pitch_id, team_ids, include_deactivated=True)]
+            if not set(order_ids) <= set(current_ids):
+                send_error_json(self, HTTPStatus.BAD_REQUEST, "El orden incluye equipos que no pertenecen a este Pitch.")
                 return
-            already_used = conn.execute(
-                "SELECT 1 FROM ai_improvements WHERE team_id = ? AND juror_id = ?",
-                (team_id, user["id"]),
-            ).fetchone()
-            if already_used is not None:
-                send_error_json(
-                    self,
-                    HTTPStatus.FORBIDDEN,
-                    "Ya usaste la mejora con IA para este equipo. Solo se permite una vez por equipo.",
-                )
-                return
-
-        try:
-            improved_text = improve_text_with_gemini(original_text)
-        except ValueError as exc:
-            send_error_json(self, HTTPStatus.BAD_GATEWAY, str(exc))
-            return
-
-        with db_connect() as conn:
-            conn.execute(
-                "INSERT OR IGNORE INTO ai_improvements (team_id, juror_id) VALUES (?, ?)",
-                (team_id, user["id"]),
-            )
+            # Los equipos que no vinieron en la lista (p. ej. desactivados)
+            # conservan su orden relativo, después de los enviados.
+            listed = set(order_ids)
+            full_order = order_ids + [team_id for team_id in current_ids if team_id not in listed]
+            save_pitch_presentation_order(conn, pitch_id, full_order)
             conn.commit()
+        send_json(self, {"ok": True, "message": "Orden de presentación guardado. Los jurados verán los equipos en este orden."})
 
-        send_json(self, {"ok": True, "improved_text": improved_text})
+    def handle_admin_juror_set_active(self, parsed) -> None:
+        user = require_user(self, ROLE_ADMIN)
+        if user is None:
+            return
+        parts = [part for part in parsed.path.split("/") if part]
+        # parts look like: ['api', 'admin', 'jurors', '<id>', 'activate' | 'deactivate']
+        if len(parts) != 5 or not parts[3].isdigit():
+            send_error_json(self, HTTPStatus.BAD_REQUEST, "Jurado inválido.")
+            return
+        juror_id = int(parts[3])
+        activate = parts[4] == "activate"
+        with db_connect() as conn:
+            juror = conn.execute("SELECT id, name, role FROM users WHERE id = ?", (juror_id,)).fetchone()
+            # Solo se pueden activar/desactivar jurados, nunca administradores.
+            if juror is None or juror["role"] != ROLE_JURY:
+                send_error_json(self, HTTPStatus.NOT_FOUND, "Jurado no encontrado.")
+                return
+            conn.execute("UPDATE users SET active = ? WHERE id = ?", (1 if activate else 0, juror_id))
+            if not activate:
+                # Cierra sus sesiones abiertas: un jurado inactivo no puede calificar.
+                conn.execute("DELETE FROM sessions WHERE user_id = ?", (juror_id,))
+            conn.commit()
+        message = (
+            f"{juror['name']} fue activado y puede volver a calificar."
+            if activate
+            else f"{juror['name']} fue desactivado: ya no puede calificar ni se espera su evaluación."
+        )
+        send_json(self, {"ok": True, "message": message})
+
+    def parse_admin_team_action(self, parsed) -> tuple[int, int] | None:
+        parts = [part for part in parsed.path.split("/") if part]
+        # parts look like: ['api', 'admin', 'team', '<id>', '<action>']
+        if len(parts) != 5 or not parts[3].isdigit():
+            send_error_json(self, HTTPStatus.BAD_REQUEST, "Equipo inválido.")
+            return None
+        return int(parts[3]), parse_pitch_id(parse_qs(parsed.query))
+
+    def handle_admin_team_move_to_end(self, parsed) -> None:
+        user = require_user(self, ROLE_ADMIN)
+        if user is None:
+            return
+        target = self.parse_admin_team_action(parsed)
+        if target is None:
+            return
+        team_id, pitch_id = target
+        with db_connect() as conn:
+            team_ids = get_pitch_team_ids(conn, pitch_id)
+            rows = get_pitch_presentation_rows(conn, pitch_id, team_ids, include_deactivated=True)
+            current_ids = [row["id"] for row in rows]
+            if team_id not in current_ids:
+                send_error_json(self, HTTPStatus.NOT_FOUND, "El equipo no pertenece a este Pitch.")
+                return
+            name = next(row["name"] for row in rows if row["id"] == team_id)
+            save_pitch_presentation_order(conn, pitch_id, [tid for tid in current_ids if tid != team_id] + [team_id])
+            conn.commit()
+        send_json(self, {"ok": True, "message": f"{name} se movió al final de la lista de presentación."})
+
+    def handle_admin_team_set_active(self, parsed) -> None:
+        user = require_user(self, ROLE_ADMIN)
+        if user is None:
+            return
+        target = self.parse_admin_team_action(parsed)
+        if target is None:
+            return
+        team_id, pitch_id = target
+        deactivate = parsed.path.rstrip("/").endswith("/deactivate")
+        with db_connect() as conn:
+            team_ids = get_pitch_team_ids(conn, pitch_id)
+            team = conn.execute("SELECT id, name FROM teams WHERE id = ?", (team_id,)).fetchone()
+            if team is None or (team_ids is not None and team_id not in team_ids):
+                send_error_json(self, HTTPStatus.NOT_FOUND, "El equipo no pertenece a este Pitch.")
+                return
+            set_pitch_team_deactivated(conn, pitch_id, team_id, deactivate)
+            conn.commit()
+        message = (
+            f"{team['name']} fue desactivado: los jurados ya no lo verán en este Pitch."
+            if deactivate
+            else f"{team['name']} fue reactivado y vuelve a aparecer para los jurados."
+        )
+        send_json(self, {"ok": True, "message": message})
 
     def handle_save_evaluation(self, parsed) -> None:
         user = require_user(self, ROLE_JURY)
@@ -1882,14 +2009,22 @@ class InnovatePitchHandler(SimpleHTTPRequestHandler):
             return
         try:
             with db_connect() as conn:
+                pitch_id = get_active_pitch(conn)
                 team_exists = conn.execute("SELECT id FROM teams WHERE id = ?", (int(team_id_text),)).fetchone()
                 if team_exists is None:
                     send_error_json(self, HTTPStatus.NOT_FOUND, "Equipo no encontrado.")
                     return
-                saved = store_evaluation(conn, int(team_id_text), user["id"], payload)
-                team_rows = conn.execute("SELECT * FROM teams ORDER BY display_order ASC, id ASC").fetchall()
-                next_team_id = get_next_pending_team_id(conn, user["id"], team_rows, int(team_id_text))
-                dashboard = get_jury_dashboard(conn, user["id"], next_team_id)
+                team_ids = get_pitch_team_ids(conn, pitch_id)
+                if team_ids is not None and int(team_id_text) not in team_ids:
+                    send_error_json(self, HTTPStatus.FORBIDDEN, "El equipo no pertenece a este Pitch.")
+                    return
+                if get_pitch_team_settings(conn, pitch_id).get(int(team_id_text), {}).get("deactivated"):
+                    send_error_json(self, HTTPStatus.FORBIDDEN, "Este equipo fue desactivado por el administrador y ya no se puede calificar.")
+                    return
+                saved = store_evaluation(conn, int(team_id_text), user["id"], payload, pitch_id)
+                team_rows = get_pitch_presentation_rows(conn, pitch_id, team_ids)
+                next_team_id = get_next_pending_team_id(conn, user["id"], team_rows, int(team_id_text), pitch_id)
+                dashboard = get_jury_dashboard(conn, user["id"], next_team_id, pitch_id)
             all_done = dashboard["progress"]["pending"] == 0
             message = (
                 "¡Evaluación guardada! Ya calificaste todos los equipos."

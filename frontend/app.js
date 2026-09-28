@@ -4,6 +4,8 @@ const state = {
   rubrics: [],
   dashboard: null,
   role: null,
+  adminPitch: null,
+  activatingPitch: null,
   activeTeamId: null,
   juryDraft: null,
   juryDirty: false,
@@ -15,11 +17,13 @@ const state = {
   deliberationOrder: null,
   deliberationSaving: false,
   confirmingDeliberation: false,
-  confirmingResetEvaluations: false,
-  resettingEvaluations: false,
-  confirmingNoShow: false,
-  aiImproving: false,
-  aiOriginalByTeam: {},
+  presentationEditing: false,
+  presentationOrder: null,
+  presentationSaving: false,
+  presentationBusyTeamId: null,
+  jurorBusyId: null,
+  confirmingDeactivateJurorId: null,
+  confirmingDeactivateTeamId: null,
 };
 
 const dom = {
@@ -149,37 +153,8 @@ async function api(path, options = {}) {
   return payload;
 }
 
-function startResetEvaluations() {
-  if (!state.user?.can_reset_evaluations) return;
-  state.confirmingResetEvaluations = true;
-  render();
-}
-
-function cancelResetEvaluations() {
-  state.confirmingResetEvaluations = false;
-  render();
-}
-
-async function confirmResetEvaluations() {
-  if (state.resettingEvaluations) return;
-  state.resettingEvaluations = true;
-  render();
-  try {
-    const response = await api('/api/admin/reset-evaluations', { method: 'DELETE' });
-    state.dashboard = response.dashboard;
-    state.confirmingResetEvaluations = false;
-    state.deliberating = false;
-    state.deliberationOrder = null;
-    setToast(response.message || 'Calificaciones reiniciadas.');
-  } catch (error) {
-    setToast(error.message, 'error');
-  } finally {
-    state.resettingEvaluations = false;
-    render();
-  }
-}
-
 function startDeliberation() {
+  if (state.adminPitch !== 1) return;
   const ranking = state.dashboard?.ranking || [];
   if (!ranking.length) return;
   state.confirmingDeliberation = true;
@@ -276,7 +251,7 @@ function handleDeliberationDragEnd() {
 
 async function exportWinnersExcel() {
   try {
-    const response = await fetch('/api/admin/export-winners', {
+    const response = await fetch(`/api/admin/export-winners?pitch=${state.adminPitch || 1}`, {
       credentials: 'same-origin',
     });
     if (!response.ok) {
@@ -286,7 +261,7 @@ async function exportWinnersExcel() {
     const blob = await response.blob();
     const disposition = response.headers.get('Content-Disposition') || '';
     const match = disposition.match(/filename="([^"]+)"/);
-    const filename = match ? match[1] : 'ganadores_top20.xlsx';
+    const filename = match ? match[1] : `ganadores_pitch${state.adminPitch || 1}.xlsx`;
     const url = URL.createObjectURL(blob);
     const link = document.createElement('a');
     link.href = url;
@@ -302,7 +277,7 @@ async function exportWinnersExcel() {
 
 async function exportAllTeamsObservationsPdf() {
   try {
-    const response = await fetch('/api/admin/export-pdf', {
+    const response = await fetch(`/api/admin/export-pdf?pitch=${state.adminPitch || 1}`, {
       credentials: 'same-origin',
     });
     if (!response.ok) {
@@ -362,6 +337,7 @@ function syncSessionState(payload) {
   state.rubrics = payload.rubrics || [];
   state.dashboard = payload.dashboard || null;
   state.role = state.user?.role || null;
+  state.adminPitch = state.role === 'admin' ? null : state.adminPitch;
   state.activeTeamId = state.role === 'admin'
     ? state.dashboard?.selected_team?.team?.id || state.dashboard?.ranking?.[0]?.id || null
     : state.dashboard?.current_team_id || null;
@@ -390,14 +366,211 @@ function render() {
   }
 
   if (state.role === 'admin') {
-    dom.dashboardRoot.innerHTML = renderAdminDashboard();
+    dom.dashboardRoot.innerHTML = !state.adminPitch
+      ? renderAdminPitchSelector()
+      : `${renderAdminPitchBar()}${state.adminPitch === 3
+        ? '<div class="empty-state">Coming soon</div>'
+        : renderAdminDashboard()}`;
   } else {
     dom.dashboardRoot.innerHTML = renderJuryDashboard();
   }
 }
 
+const ADMIN_PITCHES = [1, 2, 3];
+
+function pitchLabel(n) {
+  return `2026 - ${n} Pitch`;
+}
+
+function renderAdminPitchSelector() {
+  const activePitch = state.dashboard?.active_pitch || 1;
+  const activatingThis = (n) => state.activatingPitch === n;
+
+  const pitchTiles = ADMIN_PITCHES.map((n) => {
+    const isLive = activePitch === n;
+    const isSoon = n === 3;
+    const status = isLive
+      ? '<span class="live-pill"><span class="live-dot"></span>En vivo para jurados</span>'
+      : isSoon ? '<span class="soon-pill">Próximamente</span>' : '';
+    return `
+      <button class="pitch-tile ${isLive ? 'pitch-tile--live' : ''}" type="button" data-action="select-admin-pitch" data-pitch="${n}">
+        <span class="pitch-tile__top">
+          <span class="pitch-tile__number">${n}</span>
+          ${status}
+        </span>
+        <span class="pitch-tile__title">${pitchLabel(n)}</span>
+        <span class="pitch-tile__cta">Ver ranking y evaluaciones <span aria-hidden="true">→</span></span>
+      </button>
+    `;
+  }).join('');
+
+  const segments = ADMIN_PITCHES.map((n) => {
+    const isLive = activePitch === n;
+    const text = activatingThis(n) ? 'Activando...' : isLive ? 'Activo' : 'Activar';
+    return `
+      <button
+        class="segment ${isLive ? 'segment--active' : ''}"
+        type="button"
+        role="radio"
+        aria-checked="${isLive}"
+        data-action="activate-pitch"
+        data-pitch="${n}"
+        ${isLive || state.activatingPitch ? 'disabled' : ''}
+      >
+        <span class="segment__title">${pitchLabel(n)}</span>
+        <span class="segment__state">${isLive ? '<span class="live-dot"></span>' : ''}${text}</span>
+      </button>
+    `;
+  }).join('');
+
+  return `
+    <div class="stack">
+      <section class="card">
+        <div class="detail-header">
+          <div>
+            <p class="section-label">Seleccionar competencia</p>
+            <h3>Elige un Pitch</h3>
+            <p class="muted">Consulta el ranking y las evaluaciones de cada Pitch.</p>
+          </div>
+        </div>
+        <div class="pitch-tiles">${pitchTiles}</div>
+      </section>
+
+      <section class="card jury-control">
+        <div class="jury-control__header">
+          <div>
+            <p class="section-label">Control para jurados</p>
+            <h3>¿Qué Pitch califican los jurados?</h3>
+            <p class="muted">Define el Pitch que ven y pueden calificar los jurados ahora mismo, sin importar cuál estés consultando tú.</p>
+          </div>
+          <div class="jury-control__now">
+            <span class="jury-control__now-label">En vivo ahora</span>
+            <span class="live-pill live-pill--lg"><span class="live-dot"></span>${pitchLabel(activePitch)}</span>
+          </div>
+        </div>
+        <div class="segmented" role="radiogroup" aria-label="Pitch activo para jurados">${segments}</div>
+      </section>
+
+      ${renderJurorsCard()}
+    </div>
+    ${renderConfirmDeactivateJurorModal()}
+  `;
+}
+
+function jurorInitials(name) {
+  return String(name || '?')
+    .split(/\s+/)
+    .filter(Boolean)
+    .slice(0, 2)
+    .map((part) => part[0].toUpperCase())
+    .join('');
+}
+
+function renderJurorsCard() {
+  const jurors = state.dashboard?.jurors || [];
+  const activeCount = jurors.filter((juror) => juror.active).length;
+  const anyBusy = state.jurorBusyId !== null;
+  const rows = jurors.map((juror) => {
+    const counts = juror.evaluations_by_pitch || {};
+    const busy = state.jurorBusyId === juror.id;
+    const action = juror.active
+      ? `<button type="button" class="button button--danger-ghost button--sm" data-action="juror-deactivate" data-juror-id="${juror.id}" ${anyBusy ? 'disabled' : ''}>${busy ? 'Desactivando...' : 'Desactivar'}</button>`
+      : `<button type="button" class="button button--secondary button--sm" data-action="juror-activate" data-juror-id="${juror.id}" ${anyBusy ? 'disabled' : ''}>${busy ? 'Activando...' : 'Activar'}</button>`;
+    return `
+      <div class="juror-row ${juror.active ? '' : 'juror-row--inactive'}">
+        <span class="juror-row__avatar" aria-hidden="true">${escapeHtml(jurorInitials(juror.name))}</span>
+        <div class="juror-row__info">
+          <strong>${escapeHtml(juror.name)}</strong>
+          <span class="muted">${escapeHtml(juror.identifier)}</span>
+        </div>
+        <span class="juror-row__counts" title="Evaluaciones guardadas por Pitch">Pitch 1: ${counts['1'] || 0} · Pitch 2: ${counts['2'] || 0}</span>
+        <span class="juror-status ${juror.active ? 'juror-status--active' : ''}">${juror.active ? 'Activo' : 'Inactivo'}</span>
+        <div class="juror-row__actions">${action}</div>
+      </div>
+    `;
+  }).join('');
+
+  return `
+    <section class="card">
+      <div class="detail-header">
+        <div>
+          <p class="section-label">Jurados</p>
+          <h3>Jurados habilitados para calificar</h3>
+          <p class="muted">Si un jurado no asiste, desactívalo: no podrá iniciar sesión y los equipos dejarán de quedar "En progreso" esperando su calificación. Las calificaciones que ya guardó se conservan.</p>
+        </div>
+        <span class="badge" style="white-space:nowrap;">${activeCount} de ${jurors.length} activos</span>
+      </div>
+      <div class="juror-list">${rows || '<div class="empty-state">No hay jurados registrados.</div>'}</div>
+    </section>
+  `;
+}
+
+function renderConfirmDeactivateJurorModal() {
+  if (state.confirmingDeactivateJurorId === null) return '';
+  const juror = (state.dashboard?.jurors || []).find((item) => item.id === state.confirmingDeactivateJurorId);
+  return `
+    <div class="modal active" aria-hidden="false">
+      <div class="modal__backdrop" data-action="juror-cancel-deactivate"></div>
+      <div class="modal__panel card" style="width:min(440px, 100%);">
+        <div class="modal__header">
+          <div>
+            <p class="section-label">Confirmación</p>
+            <h3>¿Desactivar a ${escapeHtml(juror?.name || 'este jurado')}?</h3>
+          </div>
+        </div>
+        <p class="muted">Se cerrará su sesión y no podrá calificar hasta que lo actives de nuevo. Los equipos ya no esperarán su calificación para quedar como "Evaluado". Sus calificaciones guardadas se conservan.</p>
+        <div style="display:flex; justify-content:flex-end; gap:8px; margin-top:18px;">
+          <button class="button button--ghost" type="button" data-action="juror-cancel-deactivate">Cancelar</button>
+          <button class="button button--danger" type="button" data-action="juror-confirm-deactivate">Sí, desactivar</button>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+async function setJurorActive(jurorId, active) {
+  if (state.jurorBusyId !== null) return;
+  state.jurorBusyId = jurorId;
+  state.confirmingDeactivateJurorId = null;
+  render();
+  try {
+    const response = await api(`/api/admin/jurors/${jurorId}/${active ? 'activate' : 'deactivate'}`, {
+      method: 'POST',
+      body: '{}',
+    });
+    setToast(response.message || 'Cambio guardado.');
+    await loadBootstrap();
+  } catch (error) {
+    setToast(error.message, 'error');
+  } finally {
+    state.jurorBusyId = null;
+    render();
+  }
+}
+
+function renderAdminPitchBar() {
+  const activePitch = state.dashboard?.active_pitch || 1;
+  const isLive = state.adminPitch === activePitch;
+  return `
+    <div class="pitch-bar card">
+      <button class="button button--ghost" type="button" data-action="back-to-pitch-selector"><span aria-hidden="true">←</span> Todos los Pitch</button>
+      <div class="pitch-bar__info">
+        <span class="pitch-bar__label">Estás viendo</span>
+        <strong>${pitchLabel(state.adminPitch)}</strong>
+      </div>
+      ${isLive
+        ? '<span class="live-pill"><span class="live-dot"></span>En vivo para jurados</span>'
+        : `<span class="muted pitch-bar__note">Los jurados califican: ${pitchLabel(activePitch)}</span>`}
+    </div>
+  `;
+}
+
+function getAdminPitchDashboard() {
+  return state.dashboard || {};
+}
+
 function renderAdminDashboard() {
-  const dashboard = state.dashboard || {};
+  const dashboard = getAdminPitchDashboard();
   const ranking = dashboard.ranking || [];
   const selected = dashboard.selected_team;
   const summary = dashboard.summary || { teams: 0, evaluated: 0, pending: 0, jurors: 0 };
@@ -426,7 +599,8 @@ function renderAdminDashboard() {
     </section>
   `;
 
-  const WINNER_CUTOFF = 20;
+  // Pitch 1: clasifican 20 al Pitch 2. Pitch 2: salen 10 finalistas.
+  const WINNER_CUTOFF = dashboard.winners_count || (state.adminPitch === 2 ? 10 : 20);
   const rankingById = new Map(ranking.map((team) => [team.id, team]));
 
   const rankingRows = ranking.length
@@ -558,8 +732,7 @@ function renderAdminDashboard() {
         <span class="badge">Se recalcula tras cada evaluación</span>
         <div style="display:flex; gap:8px; flex-wrap:wrap; justify-content:flex-end;">
           <button class="button button--ghost" type="button" data-action="export-winners">Exportar ganadores (Excel)</button>
-          <button class="button button--secondary" type="button" data-action="start-deliberation">Deliberar</button>
-          ${state.user?.can_reset_evaluations ? '<button class="button button--danger" type="button" data-action="start-reset-evaluations">Reiniciar calificaciones</button>' : ''}
+          ${state.adminPitch === 1 ? '<button class="button button--secondary" type="button" data-action="start-deliberation">Deliberar</button>' : ''}
         </div>
       `;
 
@@ -610,30 +783,10 @@ function renderAdminDashboard() {
     `
     : '';
 
-  const confirmResetModal = state.confirmingResetEvaluations
-    ? `
-      <div class="modal active" aria-hidden="false">
-        <div class="modal__backdrop" data-action="cancel-reset-evaluations"></div>
-        <div class="modal__panel card" style="width:min(440px, 100%);">
-          <div class="modal__header">
-            <div>
-              <p class="section-label">Acción irreversible</p>
-              <h3>¿Reiniciar todas las calificaciones?</h3>
-            </div>
-          </div>
-          <p class="muted">Se borrarán TODAS las evaluaciones, puntajes y observaciones de todos los jurados, y el ranking manual (deliberación) también se reiniciará. El sistema quedará como si ningún jurado hubiera votado. Esta acción no se puede deshacer.</p>
-          <div style="display:flex; justify-content:flex-end; gap:8px; margin-top:18px;">
-            <button class="button button--ghost" type="button" data-action="cancel-reset-evaluations" ${state.resettingEvaluations ? 'disabled' : ''}>Cancelar</button>
-            <button class="button button--danger" type="button" data-action="confirm-reset-evaluations" ${state.resettingEvaluations ? 'disabled' : ''}>${state.resettingEvaluations ? 'Reiniciando...' : 'Sí, borrar todo'}</button>
-          </div>
-        </div>
-      </div>
-    `
-    : '';
-
   return `
     <div class="stack">
       ${summaryCards}
+      ${renderPresentationCard(dashboard)}
       <section class="split-grid">
         <article class="card">
           <div class="detail-header">
@@ -653,8 +806,263 @@ function renderAdminDashboard() {
       </section>
     </div>
     ${confirmDeliberationModal}
-    ${confirmResetModal}
+    ${renderConfirmDeactivateModal(dashboard)}
   `;
+}
+
+function renderPresentationInfo(team) {
+  return `
+    <div class="presentation-row__info">
+      <strong>${escapeHtml(team.name)}${dayBadge(team)}</strong>
+      ${team.schedule_time ? `<span class="muted">${escapeHtml(team.schedule_time)}</span>` : ''}
+    </div>
+  `;
+}
+
+function renderPresentationCard(dashboard) {
+  const items = dashboard.presentation || [];
+  const byId = Object.fromEntries(items.map((team) => [team.id, team]));
+  const active = items.filter((team) => !team.deactivated);
+  const inactive = items.filter((team) => team.deactivated);
+  const jurorCount = dashboard.summary?.jurors || 0;
+  const busy = (teamId) => state.presentationBusyTeamId === teamId;
+  const anyBusy = state.presentationBusyTeamId !== null;
+
+  let list;
+  if (state.presentationEditing) {
+    const order = (state.presentationOrder || []).filter((id) => byId[id]);
+    list = order.map((teamId, index) => `
+      <div class="presentation-row presentation-row--editing" draggable="true" data-presentation-index="${index}">
+        <span class="deliberation-card__handle" title="Arrastra para reordenar">⠿⠿</span>
+        <span class="presentation-row__pos">${index + 1}</span>
+        ${renderPresentationInfo(byId[teamId])}
+        <div class="presentation-row__actions">
+          <button type="button" class="button button--ghost button--sm" data-action="presentation-move-up" data-presentation-index="${index}" ${index === 0 ? 'disabled' : ''} aria-label="Subir">↑</button>
+          <button type="button" class="button button--ghost button--sm" data-action="presentation-move-down" data-presentation-index="${index}" ${index === order.length - 1 ? 'disabled' : ''} aria-label="Bajar">↓</button>
+        </div>
+      </div>
+    `).join('');
+  } else {
+    list = active.map((team, index) => `
+      <div class="presentation-row">
+        <span class="presentation-row__pos">${index + 1}</span>
+        ${renderPresentationInfo(team)}
+        <span class="status-pill" title="Evaluaciones de jurados activos">${team.active_evaluation_count ?? team.evaluation_count}/${jurorCount} eval.</span>
+        <div class="presentation-row__actions">
+          <button type="button" class="button button--ghost button--sm" data-action="presentation-move-end" data-team-id="${team.id}" ${index === active.length - 1 || anyBusy ? 'disabled' : ''}>${busy(team.id) ? 'Moviendo...' : 'Mover al final'}</button>
+          <button type="button" class="button button--danger-ghost button--sm" data-action="presentation-deactivate" data-team-id="${team.id}" ${anyBusy ? 'disabled' : ''}>Desactivar</button>
+        </div>
+      </div>
+    `).join('');
+  }
+
+  const inactiveList = inactive.length && !state.presentationEditing
+    ? `
+      <div class="presentation-inactive">
+        <p class="presentation-inactive__title">Desactivados (${inactive.length}) · solo los ven los administradores</p>
+        ${inactive.map((team) => `
+          <div class="presentation-row presentation-row--inactive">
+            <span class="presentation-row__pos">—</span>
+            ${renderPresentationInfo(team)}
+            <span class="status-pill">${team.active_evaluation_count ?? team.evaluation_count}/${jurorCount} eval.</span>
+            <div class="presentation-row__actions">
+              <button type="button" class="button button--secondary button--sm" data-action="presentation-reactivate" data-team-id="${team.id}" ${anyBusy ? 'disabled' : ''}>${busy(team.id) ? 'Reactivando...' : 'Reactivar'}</button>
+            </div>
+          </div>
+        `).join('')}
+      </div>
+    `
+    : '';
+
+  const actions = state.presentationEditing
+    ? `
+      <button class="button button--ghost" type="button" data-action="presentation-cancel" ${state.presentationSaving ? 'disabled' : ''}>Cancelar</button>
+      <button class="button button--primary" type="button" data-action="presentation-save" ${state.presentationSaving ? 'disabled' : ''}>${state.presentationSaving ? 'Guardando...' : 'Guardar orden'}</button>
+    `
+    : `<button class="button button--secondary" type="button" data-action="presentation-edit" ${active.length < 2 || anyBusy ? 'disabled' : ''}>Reordenar</button>`;
+
+  return `
+    <article class="card presentation-card">
+      <div class="detail-header">
+        <div>
+          <p class="section-label">Orden de presentación</p>
+          <h3>${state.presentationEditing ? 'Arrastra o usa las flechas para reordenar' : 'Orden en que los jurados califican'}</h3>
+          <p class="muted">Si un equipo no se presentó, muévelo al final o desactívalo para que los jurados no lo vean más.</p>
+        </div>
+        <div class="detail-header__actions">${actions}</div>
+      </div>
+      <div class="presentation-list">${list || '<div class="empty-state">No hay equipos activos en este Pitch.</div>'}</div>
+      ${inactiveList}
+    </article>
+  `;
+}
+
+function renderConfirmDeactivateModal(dashboard) {
+  if (state.confirmingDeactivateTeamId === null) return '';
+  const team = (dashboard.presentation || []).find((item) => item.id === state.confirmingDeactivateTeamId);
+  return `
+    <div class="modal active" aria-hidden="false">
+      <div class="modal__backdrop" data-action="presentation-cancel-deactivate"></div>
+      <div class="modal__panel card" style="width:min(440px, 100%);">
+        <div class="modal__header">
+          <div>
+            <p class="section-label">Confirmación</p>
+            <h3>¿Desactivar a ${escapeHtml(team?.name || 'este equipo')}?</h3>
+          </div>
+        </div>
+        <p class="muted">Los jurados dejarán de verlo en ${pitchLabel(state.adminPitch)} y no podrán calificarlo. Las evaluaciones que ya tenga se conservan y puedes reactivarlo cuando quieras.</p>
+        <div style="display:flex; justify-content:flex-end; gap:8px; margin-top:18px;">
+          <button class="button button--ghost" type="button" data-action="presentation-cancel-deactivate">Cancelar</button>
+          <button class="button button--danger" type="button" data-action="presentation-confirm-deactivate">Sí, desactivar</button>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+function startPresentationEdit() {
+  state.presentationOrder = (state.dashboard?.presentation || [])
+    .filter((team) => !team.deactivated)
+    .map((team) => team.id);
+  state.presentationEditing = true;
+  render();
+}
+
+function resetPresentationState() {
+  state.presentationEditing = false;
+  state.presentationOrder = null;
+  state.confirmingDeactivateTeamId = null;
+}
+
+function cancelPresentationEdit() {
+  resetPresentationState();
+  render();
+}
+
+function reorderPresentation(fromIndex, toIndex) {
+  const order = state.presentationOrder;
+  if (!order || toIndex < 0 || toIndex >= order.length || fromIndex === toIndex) return;
+  const updated = [...order];
+  const [moved] = updated.splice(fromIndex, 1);
+  updated.splice(toIndex, 0, moved);
+  state.presentationOrder = updated;
+  render();
+}
+
+async function savePresentationOrder() {
+  if (!state.presentationOrder || state.presentationSaving) return;
+  state.presentationSaving = true;
+  render();
+  try {
+    const response = await api(`/api/admin/presentation-order?pitch=${state.adminPitch}`, {
+      method: 'PUT',
+      body: JSON.stringify({ order: state.presentationOrder }),
+    });
+    resetPresentationState();
+    setToast(response.message || 'Orden guardado.');
+    await loadDashboard(state.activeTeamId, state.adminPitch);
+  } catch (error) {
+    setToast(error.message, 'error');
+  } finally {
+    state.presentationSaving = false;
+    render();
+  }
+}
+
+async function runPresentationTeamAction(teamId, action) {
+  if (state.presentationBusyTeamId !== null) return;
+  state.presentationBusyTeamId = teamId;
+  state.confirmingDeactivateTeamId = null;
+  render();
+  try {
+    const response = await api(`/api/admin/team/${teamId}/${action}?pitch=${state.adminPitch}`, {
+      method: 'POST',
+      body: '{}',
+    });
+    setToast(response.message || 'Cambio guardado.');
+    await loadDashboard(state.activeTeamId, state.adminPitch);
+  } catch (error) {
+    setToast(error.message, 'error');
+  } finally {
+    state.presentationBusyTeamId = null;
+    render();
+  }
+}
+
+let presentationDragIndex = null;
+
+function handlePresentationDragStart(event) {
+  const row = event.target.closest('.presentation-row--editing');
+  if (!row) return;
+  presentationDragIndex = Number(row.dataset.presentationIndex);
+  if (event.dataTransfer) {
+    event.dataTransfer.effectAllowed = 'move';
+    event.dataTransfer.setData('text/plain', String(presentationDragIndex));
+  }
+  row.classList.add('dragging');
+}
+
+function handlePresentationDragOver(event) {
+  const row = event.target.closest('.presentation-row--editing');
+  if (!row || presentationDragIndex === null) return;
+  event.preventDefault();
+  if (event.dataTransfer) event.dataTransfer.dropEffect = 'move';
+}
+
+function handlePresentationDrop(event) {
+  const row = event.target.closest('.presentation-row--editing');
+  if (!row || presentationDragIndex === null) return;
+  event.preventDefault();
+  const fromIndex = presentationDragIndex;
+  presentationDragIndex = null;
+  reorderPresentation(fromIndex, Number(row.dataset.presentationIndex));
+}
+
+function handlePresentationDragEnd() {
+  presentationDragIndex = null;
+  document.querySelectorAll('.presentation-row.dragging').forEach((el) => el.classList.remove('dragging'));
+}
+
+function selectAdminPitch(pitch) {
+  state.adminPitch = Number(pitch);
+  if (state.adminPitch === 3) {
+    render();
+    return;
+  }
+  loadDashboard(null, state.adminPitch);
+}
+
+function backToPitchSelector() {
+  if ((state.deliberating || state.presentationEditing) && !window.confirm('Tienes un orden sin guardar. Si sales, se perderán los cambios.')) {
+    return;
+  }
+  state.deliberating = false;
+  state.deliberationOrder = null;
+  state.confirmingDeliberation = false;
+  resetPresentationState();
+  state.adminPitch = null;
+  render();
+  window.scrollTo({ top: 0, behavior: 'smooth' });
+}
+
+async function activatePitchForJurors(pitch) {
+  const pitchNum = Number(pitch);
+  if (state.activatingPitch) return;
+  state.activatingPitch = pitchNum;
+  render();
+  try {
+    const response = await api('/api/admin/active-pitch', {
+      method: 'PUT',
+      body: JSON.stringify({ pitch: pitchNum }),
+    });
+    state.dashboard = { ...(state.dashboard || {}), active_pitch: response.active_pitch || pitchNum };
+    setToast(response.message || `Pitch ${pitchNum} activado para los jurados.`);
+  } catch (error) {
+    setToast(error.message, 'error');
+  } finally {
+    state.activatingPitch = null;
+    render();
+  }
 }
 
 const VALID_SCORE_VALUES = [1, 1.5, 2, 2.5, 3, 3.5, 4, 4.5, 5];
@@ -691,26 +1099,38 @@ function renderJuryDashboard() {
   }
 
   const currentDraft = state.juryDraft;
-  const confirmNoShowModal = state.confirmingNoShow
-    ? `
-      <div class="modal active" aria-hidden="false">
-        <div class="modal__backdrop" data-action="cancel-jury-no-show"></div>
-        <div class="modal__panel card" style="width:min(440px, 100%);">
-          <div class="modal__header">
-            <div>
-              <p class="section-label">Confirmación</p>
-              <h3>¿Estás seguro de marcar a ${escapeHtml(currentSummary?.name || 'este equipo')} como "No asistió"?</h3>
-            </div>
-          </div>
-          <p class="muted">Recuerda que esto hará que el equipo se vaya al final de la lista de su día para calificar.</p>
-          <div style="display:flex; justify-content:flex-end; gap:8px; margin-top:18px;">
-            <button class="button button--ghost" type="button" data-action="cancel-jury-no-show">Cancelar</button>
-            <button class="button button--danger" type="button" data-action="confirm-jury-no-show">Sí, no asistió</button>
-          </div>
+
+  if (!currentSummary) {
+    const pitchLabel = dashboard.pitch_id ? `Pitch ${dashboard.pitch_id}` : 'este Pitch';
+    const allDone = (progress.assigned || 0) > 0 && (progress.pending || 0) === 0;
+    if (allDone) {
+      return `
+        <div class="jury-header stack">
+          <section class="card jury-complete">
+            <div class="jury-complete__icon" aria-hidden="true">✓</div>
+            <p class="section-label">Evaluación completada</p>
+            <h3>Ya no hay más equipos para calificar</h3>
+            <p class="jury-complete__thanks">Muchas gracias por evaluar con criterio y profesionalismo.</p>
+            <span class="badge">${progress.completed || progress.assigned} de ${progress.assigned} equipos calificados</span>
+            <p class="muted jury-complete__note">Cuando el administrador active el siguiente Pitch, aparecerá aquí automáticamente.</p>
+          </section>
         </div>
+      `;
+    }
+    const emptyMessage = `Todavía no hay equipos por calificar en ${pitchLabel}. Espera a que el administrador lo active.`;
+    return `
+      <div class="jury-header stack">
+        <section class="team-hero">
+          <article class="team-card">
+            <p class="section-label">Equipo actual</p>
+            <h3>No hay equipos por calificar</h3>
+            <p class="muted">${escapeHtml(emptyMessage)}</p>
+          </article>
+        </section>
       </div>
-    `
-    : '';
+    `;
+  }
+
   const teamInfo = currentSummary
     ? `
       <article class="team-card">
@@ -781,12 +1201,6 @@ function renderJuryDashboard() {
     : 'Lista para avanzar';
 
   const saveDisabled = !isDraftComplete(currentDraft);
-  const rubricAlreadyScored = scoreFields.every((key) => isValidScoreValue(currentDraft?.scores?.[key]));
-  const aiUsed = Boolean(dashboard.ai_improvement_used);
-  const hasObservationsText = Boolean((currentDraft.observations || '').trim());
-  const aiOriginalText = dashboard.current_team_id !== undefined && dashboard.current_team_id !== null
-    ? state.aiOriginalByTeam[dashboard.current_team_id]
-    : undefined;
 
   return `
     <div class="jury-header stack">
@@ -812,12 +1226,6 @@ function renderJuryDashboard() {
         <p class="section-label">Observaciones</p>
         <h3>Comentarios para el equipo <span class="required-marker">*</span></h3>
         <textarea id="jury-observations" placeholder="Escriba aquí sus observaciones (obligatorio)..." required>${escapeHtml(currentDraft.observations || '')}</textarea>
-        <div class="ai-actions">
-          ${!aiUsed
-            ? `<button type="button" class="button button--ghost" data-action="ai-improve" ${state.aiImproving || !hasObservationsText ? 'disabled' : ''}>${state.aiImproving ? 'Mejorando...' : '✨ Mejorar con IA'}</button>`
-            : `<span class="ai-used-note">✨ Ya usaste tu mejora con IA para este equipo</span>`}
-          ${aiOriginalText !== undefined ? `<button type="button" class="button button--ghost" data-action="ai-revert">↩ Volver a texto original</button>` : ''}
-        </div>
         ${currentEvaluationCard}
       </section>
 
@@ -826,13 +1234,11 @@ function renderJuryDashboard() {
         <h3>Flujo secuencial</h3>
         <p class="navigation-card__team">Equipo actual: <strong>${escapeHtml(currentSummary?.name || '—')}</strong></p>
         <div class="navigation-actions">
-          <button class="button button--danger" type="button" data-action="jury-no-show" ${rubricAlreadyScored ? 'disabled title="Ya calificaste este equipo, no puedes marcarlo como no asistió."' : ''}>No asistió</button>
           <button class="button button--primary" type="button" data-action="jury-save" ${saveDisabled ? 'disabled' : ''}>Guardar evaluación</button>
         </div>
-        <div class="inline-feedback">${state.juryDirty ? 'Tienes cambios sin guardar.' : 'Al guardar avanzas automáticamente al siguiente equipo pendiente. Si el equipo no se presentó, usa "No asistió" para pasarlo al final de la lista.'}</div>
+        <div class="inline-feedback">${state.juryDirty ? 'Tienes cambios sin guardar.' : 'Al guardar avanzas automáticamente al siguiente equipo pendiente.'}</div>
       </section>
     </div>
-    ${confirmNoShowModal}
   `;
 }
 
@@ -885,17 +1291,19 @@ function confirmDiscardChanges() {
   return window.confirm('Tienes cambios sin guardar. Si continúas, se perderán los cambios actuales.');
 }
 
-async function loadDashboard(teamId = null) {
+async function loadDashboard(teamId = null, pitchId = state.adminPitch || 1) {
   if (!state.authenticated || !state.user) return;
   const role = state.user.role;
+  const activePitch = role === 'admin' ? Number(pitchId) || 1 : 1;
   const endpoint = role === 'admin'
-    ? `/api/admin/dashboard${teamId ? `?team_id=${teamId}` : ''}`
+    ? `/api/admin/dashboard?pitch=${activePitch}${teamId ? `&team_id=${teamId}` : ''}`
     : `/api/jury/dashboard${teamId ? `?team_id=${teamId}` : ''}`;
 
   state.loading = true;
   try {
     const payload = await api(endpoint);
     state.dashboard = payload.dashboard;
+    if (role === 'admin') state.adminPitch = activePitch;
     state.activeTeamId = role === 'admin'
       ? payload.dashboard?.selected_team?.team?.id || teamId || state.dashboard?.ranking?.[0]?.id || null
       : payload.dashboard?.current_team_id || teamId || state.dashboard?.current_team_id || null;
@@ -966,6 +1374,7 @@ async function forceLogout(showMessage = true) {
   state.rubrics = [];
   state.dashboard = null;
   state.role = null;
+  state.adminPitch = null;
   state.activeTeamId = null;
   state.juryDraft = null;
   state.juryDirty = false;
@@ -1015,93 +1424,6 @@ async function handleSaveEvaluation() {
   }
 }
 
-async function handleAiImprove() {
-  if (state.role !== 'jury' || !state.dashboard?.current_team_id) return;
-  if (state.dashboard.ai_improvement_used || state.aiImproving) return;
-
-  const teamId = state.dashboard.current_team_id;
-  const text = (state.juryDraft?.observations || '').trim();
-  if (!text) {
-    setToast('Escribe una observación antes de mejorarla con IA.', 'error');
-    return;
-  }
-
-  state.aiImproving = true;
-  render();
-  try {
-    const response = await api(`/api/jury/team/${teamId}/improve-observations`, {
-      method: 'POST',
-      body: JSON.stringify({ texto_original: text }),
-    });
-    state.aiOriginalByTeam[teamId] = text;
-    state.juryDraft.observations = response.improved_text;
-    state.juryDirty = true;
-    state.dashboard.ai_improvement_used = true;
-    setToast('Observación mejorada con IA. Puedes editarla o volver al texto original.');
-  } catch (error) {
-    setToast(error.message, 'error');
-  } finally {
-    state.aiImproving = false;
-    render();
-  }
-}
-
-function handleAiRevert() {
-  const teamId = state.dashboard?.current_team_id;
-  if (teamId === undefined || teamId === null) return;
-  const original = state.aiOriginalByTeam[teamId];
-  if (original === undefined) return;
-  state.juryDraft.observations = original;
-  state.juryDirty = true;
-  delete state.aiOriginalByTeam[teamId];
-  render();
-}
-
-function startJuryNoShow() {
-  if (state.role !== 'jury' || !state.dashboard?.current_team_id) return;
-  const rubricAlreadyScored = scoreFields.every((key) => isValidScoreValue(state.juryDraft?.scores?.[key]));
-  if (rubricAlreadyScored) {
-    setToast('Ya calificaste este equipo, no puedes marcarlo como no asistió.', 'error');
-    return;
-  }
-  state.confirmingNoShow = true;
-  render();
-}
-
-function cancelJuryNoShow() {
-  state.confirmingNoShow = false;
-  render();
-}
-
-async function confirmJuryNoShow() {
-  if (state.role !== 'jury' || !state.dashboard?.current_team_id) return;
-  if (!confirmDiscardChanges()) {
-    state.confirmingNoShow = false;
-    render();
-    return;
-  }
-
-  const teamId = state.dashboard.current_team_id;
-  try {
-    const response = await api(`/api/jury/team/${teamId}/no-show`, {
-      method: 'POST',
-      body: '{}',
-    });
-    state.dashboard = response.dashboard;
-    state.juryDraft = buildDraftFromEvaluation(response.dashboard.current_evaluation);
-    state.juryDirty = false;
-    state.activeTeamId = response.dashboard.current_team_id;
-    state.confirmingNoShow = false;
-    render();
-    scrollDashboardToTop();
-    setToast(response.message || "Equipo marcado como 'No asistió'.");
-  } catch (error) {
-    state.confirmingNoShow = false;
-    setToast(error.message, 'error');
-    render();
-  }
-}
-
 async function navigateTeam(offsetOrId) {
   if (state.role !== 'jury') return;
   if (!confirmDiscardChanges()) return;
@@ -1140,6 +1462,91 @@ function handleRootClick(event) {
   if (!actionElement) return;
   const action = actionElement.dataset.action;
 
+  if (action === 'select-admin-pitch') {
+    selectAdminPitch(actionElement.dataset.pitch);
+    return;
+  }
+
+  if (action === 'juror-deactivate') {
+    state.confirmingDeactivateJurorId = Number(actionElement.dataset.jurorId);
+    render();
+    return;
+  }
+
+  if (action === 'juror-cancel-deactivate') {
+    state.confirmingDeactivateJurorId = null;
+    render();
+    return;
+  }
+
+  if (action === 'juror-confirm-deactivate') {
+    setJurorActive(state.confirmingDeactivateJurorId, false);
+    return;
+  }
+
+  if (action === 'juror-activate') {
+    setJurorActive(Number(actionElement.dataset.jurorId), true);
+    return;
+  }
+
+  if (action === 'presentation-edit') {
+    startPresentationEdit();
+    return;
+  }
+
+  if (action === 'presentation-cancel') {
+    cancelPresentationEdit();
+    return;
+  }
+
+  if (action === 'presentation-save') {
+    savePresentationOrder();
+    return;
+  }
+
+  if (action === 'presentation-move-up' || action === 'presentation-move-down') {
+    const index = Number(actionElement.dataset.presentationIndex);
+    reorderPresentation(index, action === 'presentation-move-up' ? index - 1 : index + 1);
+    return;
+  }
+
+  if (action === 'presentation-move-end') {
+    runPresentationTeamAction(Number(actionElement.dataset.teamId), 'move-to-end');
+    return;
+  }
+
+  if (action === 'presentation-deactivate') {
+    state.confirmingDeactivateTeamId = Number(actionElement.dataset.teamId);
+    render();
+    return;
+  }
+
+  if (action === 'presentation-cancel-deactivate') {
+    state.confirmingDeactivateTeamId = null;
+    render();
+    return;
+  }
+
+  if (action === 'presentation-confirm-deactivate') {
+    runPresentationTeamAction(state.confirmingDeactivateTeamId, 'deactivate');
+    return;
+  }
+
+  if (action === 'presentation-reactivate') {
+    runPresentationTeamAction(Number(actionElement.dataset.teamId), 'reactivate');
+    return;
+  }
+
+  if (action === 'back-to-pitch-selector') {
+    backToPitchSelector();
+    return;
+  }
+
+  if (action === 'activate-pitch') {
+    activatePitchForJurors(actionElement.dataset.pitch);
+    return;
+  }
+
   if (action === 'select-admin-team') {
     const teamId = actionElement.dataset.teamId;
     if (teamId) loadDashboard(teamId);
@@ -1171,21 +1578,6 @@ function handleRootClick(event) {
     return;
   }
 
-  if (action === 'start-reset-evaluations') {
-    startResetEvaluations();
-    return;
-  }
-
-  if (action === 'cancel-reset-evaluations') {
-    cancelResetEvaluations();
-    return;
-  }
-
-  if (action === 'confirm-reset-evaluations') {
-    confirmResetEvaluations();
-    return;
-  }
-
   if (action === 'cancel-deliberation') {
     cancelDeliberation();
     return;
@@ -1200,31 +1592,6 @@ function handleRootClick(event) {
     const index = Number(actionElement.dataset.deliberationIndex);
     const targetIndex = action === 'deliberation-move-up' ? index - 1 : index + 1;
     reorderDeliberation(index, targetIndex);
-    return;
-  }
-
-  if (action === 'jury-no-show') {
-    startJuryNoShow();
-    return;
-  }
-
-  if (action === 'cancel-jury-no-show') {
-    cancelJuryNoShow();
-    return;
-  }
-
-  if (action === 'confirm-jury-no-show') {
-    confirmJuryNoShow();
-    return;
-  }
-
-  if (action === 'ai-improve') {
-    handleAiImprove();
-    return;
-  }
-
-  if (action === 'ai-revert') {
-    handleAiRevert();
     return;
   }
 
@@ -1262,10 +1629,6 @@ function handleRootInput(event) {
     if (saveButton) {
       saveButton.disabled = !isDraftComplete(state.juryDraft);
     }
-    const aiButton = document.querySelector('[data-action="ai-improve"]');
-    if (aiButton) {
-      aiButton.disabled = state.aiImproving || !target.value.trim();
-    }
     return;
   }
 
@@ -1279,7 +1642,15 @@ async function handleRefresh() {
     await loadBootstrap();
     return;
   }
-  await loadDashboard(state.activeTeamId);
+  if (state.role === 'admin' && !state.adminPitch) {
+    await loadBootstrap();
+    return;
+  }
+  if (state.role === 'admin' && state.adminPitch === 3) {
+    render();
+    return;
+  }
+  await loadDashboard(state.activeTeamId, state.adminPitch || 1);
 }
 
 async function handleLogout() {
@@ -1305,6 +1676,10 @@ function bindEvents() {
   dom.dashboardRoot.addEventListener('dragover', handleDeliberationDragOver);
   dom.dashboardRoot.addEventListener('drop', handleDeliberationDrop);
   dom.dashboardRoot.addEventListener('dragend', handleDeliberationDragEnd);
+  dom.dashboardRoot.addEventListener('dragstart', handlePresentationDragStart);
+  dom.dashboardRoot.addEventListener('dragover', handlePresentationDragOver);
+  dom.dashboardRoot.addEventListener('drop', handlePresentationDrop);
+  dom.dashboardRoot.addEventListener('dragend', handlePresentationDragEnd);
   dom.logoutButton.addEventListener('click', handleLogout);
   dom.refreshButton.addEventListener('click', handleRefresh);
   dom.teamModal.addEventListener('click', handleRootClick);

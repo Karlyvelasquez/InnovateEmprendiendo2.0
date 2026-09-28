@@ -1,5 +1,10 @@
-innovate_pitch.db
+.env
+.env.*
+*.db
+*.db-shm
+*.db-wal
 __pycache__/
 *.pyc
-.env
+.venv/
+.vscode/
 users_seed.json

@@ -6,6 +6,8 @@ API while storing all data in PostgreSQL/Neon.
 from __future__ import annotations
 
 import re
+import threading
+import time
 from typing import Any, Iterable
 
 import psycopg
@@ -61,14 +63,19 @@ def _translate_sql(sql: str) -> str:
 
 class PGConnection:
     def __init__(self, conn):
-        # `conn` is a raw psycopg connection, owned by the module-level pool
-        # below (`connect()`), not by this wrapper. This wrapper is cheap and
-        # created fresh per-request; the underlying TCP/TLS connection to
-        # Neon is what actually gets reused across requests in a warm
-        # Vercel container.
+        # `conn` is a raw psycopg connection borrowed from the module-level
+        # pool below (`connect()`). This wrapper is cheap and created fresh
+        # per request; leaving the `with` block hands the connection back to
+        # the pool so the next request skips the TCP+TLS+auth handshake.
         self._conn = conn
+        # Per-request cache for read helpers in server.py (e.g. the ranking
+        # computation). Any write through this wrapper clears it, so cached
+        # values never outlive a change made in the same request.
+        self.cache: dict[Any, Any] = {}
 
     def execute(self, sql: str, params: Iterable[Any] | None = None) -> CompatCursor:
+        if not re.match(r"^\s*SELECT\b", sql, flags=re.I):
+            self.cache.clear()
         sql = _translate_sql(sql)
         cursor = self._conn.cursor()
         try:
@@ -88,6 +95,7 @@ class PGConnection:
     def executescript(self, script: str) -> None:
         # Schema is supplied as PostgreSQL-compatible DDL. Execute statements
         # one by one so the existing application can keep this call site.
+        self.cache.clear()
         for statement in script.split(";"):
             statement = statement.strip()
             if statement:
@@ -100,17 +108,14 @@ class PGConnection:
         self._conn.rollback()
 
     def close(self):
-        # Deliberately a no-op: the raw connection is owned by the
-        # module-level pool in `connect()` and is kept open so the *next*
-        # request on this same warm serverless container can reuse it
-        # instead of paying a fresh TCP+TLS+auth handshake to Neon.
+        # Deliberately a no-op: the connection goes back to the pool when the
+        # `with db_connect() as conn:` block ends (see __exit__).
         pass
 
     def __enter__(self):
         return self
 
     def __exit__(self, exc_type, exc, tb):
-        global _shared_conn
         try:
             if exc_type is None:
                 self._conn.commit()
@@ -118,55 +123,76 @@ class PGConnection:
                 self._conn.rollback()
         except Exception:
             # Connection is in a bad state (e.g. Neon closed it server-side
-            # after being idle). Drop it so the next call reconnects instead
-            # of repeatedly failing on a dead connection.
-            try:
-                self._conn.close()
-            except Exception:
-                pass
-            _shared_conn = None
+            # after being idle). Drop it instead of returning it to the pool.
+            _discard(self._conn)
             if exc_type is None:
                 raise
+            return
+        _release(self._conn)
 
 
-# One physical connection per warm container, reused across requests.
-# `db_connect()` in server.py calls this once per request; we hand back a
-# thin wrapper around the same underlying psycopg connection whenever it's
-# still alive, instead of reconnecting to Neon from scratch every time.
-_shared_conn: "psycopg.Connection | None" = None
+# Small pool of idle connections shared by ALL threads. ThreadingHTTPServer
+# (used when running `python server.py` locally) spawns a new thread per
+# request, so a per-thread connection was never reused locally: every request
+# paid a fresh TCP+TLS+auth handshake to Neon (~2 s from Colombia). Each
+# connection is still used by only one request at a time: it is taken out of
+# the pool while a request holds it, which keeps psycopg's "one thread per
+# connection" rule. On Vercel a warm container simply reuses the one idle
+# connection it keeps.
+_POOL_MAX_IDLE = 5
+# Only verify a pooled connection with a round trip if it sat idle this long;
+# checking on every request would add a full round trip to Neon each time.
+_POOL_CHECK_AFTER_SECONDS = 60
+_pool_lock = threading.Lock()
+_idle: list[tuple["psycopg.Connection", float]] = []
+
+
+def _open_connection(url: str) -> "psycopg.Connection":
+    return psycopg.connect(
+        url,
+        row_factory=dict_row,
+        connect_timeout=10,
+        # Keep the TCP connection alive through NAT/proxies between
+        # requests instead of it silently dying while idle.
+        keepalives=1,
+        keepalives_idle=30,
+        keepalives_interval=10,
+        keepalives_count=3,
+    )
+
+
+def _discard(conn: "psycopg.Connection") -> None:
+    try:
+        conn.close()
+    except Exception:
+        pass
+
+
+def _release(conn: "psycopg.Connection") -> None:
+    if conn.closed or conn.info.transaction_status != psycopg.pq.TransactionStatus.IDLE:
+        _discard(conn)
+        return
+    with _pool_lock:
+        if len(_idle) < _POOL_MAX_IDLE:
+            _idle.append((conn, time.monotonic()))
+            return
+    _discard(conn)
 
 
 def connect(url: str) -> PGConnection:
-    global _shared_conn
-    if _shared_conn is None or _shared_conn.closed:
-        _shared_conn = psycopg.connect(
-            url,
-            row_factory=dict_row,
-            connect_timeout=10,
-            # Keep the TCP connection alive through NAT/proxies between
-            # requests instead of it silently dying while idle.
-            keepalives=1,
-            keepalives_idle=30,
-            keepalives_interval=10,
-            keepalives_count=3,
-        )
-    else:
-        try:
-            # Cheap liveness check — a stale/half-closed connection from a
-            # previous invocation should be replaced, not reused blindly.
-            _shared_conn.execute("SELECT 1")
-        except Exception:
+    while True:
+        with _pool_lock:
+            conn, last_used = _idle.pop() if _idle else (None, 0.0)
+        if conn is None:
+            return PGConnection(_open_connection(url))
+        if conn.closed:
+            continue
+        if time.monotonic() - last_used > _POOL_CHECK_AFTER_SECONDS:
             try:
-                _shared_conn.close()
+                # Cheap liveness check for a connection that sat idle long
+                # enough for Neon or a proxy to have dropped it.
+                conn.execute("SELECT 1")
             except Exception:
-                pass
-            _shared_conn = psycopg.connect(
-                url,
-                row_factory=dict_row,
-                connect_timeout=10,
-                keepalives=1,
-                keepalives_idle=30,
-                keepalives_interval=10,
-                keepalives_count=3,
-            )
-    return PGConnection(_shared_conn)
+                _discard(conn)
+                continue
+        return PGConnection(conn)

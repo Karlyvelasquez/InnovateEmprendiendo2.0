@@ -5,17 +5,48 @@
 *.db
 *.db-shm
 *.db-wal
+*.sqlite
+*.sqlite3
 users_seed.json
+
+# Llaves y credenciales
+*.pem
+*.key
+*.p12
+*.pfx
+*credentials*.json
+*secret*
+
+# Datos personales de participantes (nombres completos de líderes).
+# Solo se usa para sembrar una base vacía; Neon ya tiene los equipos cargados.
+teams_schedule.csv
+
+# Exportes con resultados y observaciones de jurados
+*.xlsx
+*.xls
+*.pdf
 
 # Python
 __pycache__/
 *.py[cod]
 .venv/
 venv/
+.pytest_cache/
+
+# Node (por si se agregan herramientas de frontend)
+node_modules/
+
+# Logs / temporales
+*.log
+*.tmp
+*.bak
+~$*
 
 # Vercel
 .vercel/
-*.sqlite
-*.sqlite3
+
+# Editor / SO
 .vscode/
+.idea/
 .DS_Store
+Thumbs.db
