@@ -125,7 +125,46 @@ RUBRICS = [
     },
 ]
 
+# Rúbrica del Pitch 2: mismos criterios, con más peso al modelo de negocio.
+RUBRICS_PITCH_TWO = [
+    {
+        "key": "problem_score",
+        "label": "Identificación del problema",
+        "weight": 0.15,
+        "description": "Evalúa la claridad con la que se identifica y sustenta el problema, demostrando su relevancia y el impacto que genera en los usuarios.",
+    },
+    {
+        "key": "value_score",
+        "label": "Propuesta de valor",
+        "weight": 0.15,
+        "description": "Evalúa qué tan innovadora, diferenciadora y pertinente es la solución planteada para responder al problema identificado, así como el valor que aporta a los usuarios.",
+    },
+    {
+        "key": "validation_score",
+        "label": "Validación de la solución",
+        "weight": 0.15,
+        "description": "Evalúa la evidencia que respalda la propuesta, considerando pruebas realizadas, pilotos, entrevistas, retroalimentación de usuarios o resultados obtenidos.",
+    },
+    {
+        "key": "business_score",
+        "label": "Modelo de negocio",
+        "weight": 0.40,
+        "description": "Viabilidad, sostenibilidad y escalabilidad del modelo de negocio, incluyendo propuesta de ingresos, estrategia de implementación, análisis de costos, aliados clave y proyección de crecimiento e impacto a largo plazo.",
+    },
+    {
+        "key": "pitch_score",
+        "label": "Calidad del pitch",
+        "weight": 0.15,
+        "description": "Evalúa la claridad, organización y capacidad de comunicación durante la presentación, el manejo del tiempo, el dominio del tema y la respuesta a las preguntas del jurado.",
+    },
+]
+
 RUBRIC_KEYS = [item["key"] for item in RUBRICS]
+
+
+def get_rubrics(pitch_id: int) -> list[dict[str, Any]]:
+    """Rúbrica (criterios, pesos y descripciones) de cada Pitch."""
+    return RUBRICS_PITCH_TWO if pitch_id == PITCH_TWO else RUBRICS
 
 
 def utc_now() -> datetime:
@@ -1069,6 +1108,7 @@ def get_jury_dashboard(conn: sqlite3.Connection, juror_id: int, team_id: int | N
         "ranking": ranking,
         "juror_count": juror_count,
         "pitch_id": pitch_id,
+        "rubrics": get_rubrics(pitch_id),
     }
 
 
@@ -1418,6 +1458,7 @@ def get_admin_dashboard(conn: sqlite3.Connection, selected_team_id: int | None =
         "pitch_id": pitch_id,
         "active_pitch": get_active_pitch(conn),
         "winners_count": winners_count_for_pitch(pitch_id),
+        "rubrics": get_rubrics(pitch_id),
     }
 
 
@@ -1443,14 +1484,10 @@ def store_evaluation(conn: sqlite3.Connection, team_id: int, juror_id: int, payl
     observations = str(payload.get("observations", "")).strip()
     if not observations:
         raise ValueError("Debe escribir observaciones antes de guardar la evaluación.")
-    final_score_5 = round(
-        scores["problem_score"] * 0.20
-        + scores["value_score"] * 0.25
-        + scores["validation_score"] * 0.20
-        + scores["business_score"] * 0.20
-        + scores["pitch_score"] * 0.15,
-        4,
-    )
+    # Pesos de la rúbrica del Pitch que se está calificando (el Pitch 1
+    # conserva sus pesos originales: 20/25/20/20/15).
+    weights = {rubric["key"]: rubric["weight"] for rubric in get_rubrics(pitch_id)}
+    final_score_5 = round(sum(scores[key] * weights[key] for key in RUBRIC_KEYS), 4)
     final_score_100 = round(final_score_5 * 20, 4)
     timestamp = iso_now()
     existing = conn.execute(

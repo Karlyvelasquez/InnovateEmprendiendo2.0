@@ -301,6 +301,12 @@ async function exportAllTeamsObservationsPdf() {
   }
 }
 
+// Cada Pitch puede tener su propia rúbrica; el dashboard trae la del Pitch
+// que se está viendo (admin) o calificando (jurado).
+function currentRubrics() {
+  return state.dashboard?.rubrics || state.rubrics;
+}
+
 function rubricLabel(rubric) {
   return `${rubric.label} — ${Math.round(rubric.weight * 100)}%`;
 }
@@ -643,7 +649,7 @@ function renderAdminDashboard() {
     : '<div class="empty-state">No hay equipos cargados.</div>';
 
   const rubricAverages = selectedTeam
-    ? state.rubrics.map((rubric) => `
+    ? currentRubrics().map((rubric) => `
         <article class="rubric-card">
           <h4>${escapeHtml(rubric.label)}</h4>
           <p>${escapeHtml(rubric.description)}</p>
@@ -1172,7 +1178,7 @@ function renderJuryDashboard() {
     </aside>
   `;
 
-  const rubricCards = state.rubrics.map((rubric) => `
+  const rubricCards = currentRubrics().map((rubric) => `
     <article class="rubric-card">
       <div class="rubric-shell-header">
         <div>
