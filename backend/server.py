@@ -338,6 +338,7 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
         ALTER TABLE ranking_history ADD COLUMN IF NOT EXISTS pitch_id INTEGER NOT NULL DEFAULT 1;
         ALTER TABLE no_shows ADD COLUMN IF NOT EXISTS pitch_id INTEGER NOT NULL DEFAULT 1;
         ALTER TABLE ai_improvements ADD COLUMN IF NOT EXISTS pitch_id INTEGER NOT NULL DEFAULT 1;
+        ALTER TABLE pitch_team_settings ADD COLUMN IF NOT EXISTS manual_position INTEGER;
         """
     )
     conn.execute("ALTER TABLE evaluations DROP CONSTRAINT IF EXISTS evaluations_team_id_juror_id_key")
@@ -581,7 +582,13 @@ def _compute_team_stats(conn: sqlite3.Connection, pitch_id: int, team_ids: set[i
             "source_row": team["source_row"],
             "schedule_day": team["schedule_day"],
             "schedule_time": team["schedule_time"],
-            "manual_position": team["manual_position"],
+            # Pitch 1: deliberación guardada en teams (como siempre).
+            # Otros Pitch: deliberación propia en pitch_team_settings.
+            "manual_position": (
+                team["manual_position"]
+                if pitch_id == PITCH_ONE
+                else settings.get(team["id"], {}).get("manual_position")
+            ),
             "evaluation_count": evaluation_count,
             "active_evaluation_count": active_evaluation_count,
             "no_show_count": no_show_count,
@@ -597,7 +604,7 @@ def _compute_team_stats(conn: sqlite3.Connection, pitch_id: int, team_ids: set[i
         evaluations_by_team_serialized[team["id"]] = serialized_evaluations
 
     def ranking_sort_key(item: dict[str, Any]) -> tuple:
-        has_manual = pitch_id == PITCH_ONE and item["manual_position"] is not None
+        has_manual = item["manual_position"] is not None
         return (
             # Los equipos desactivados por el admin siempre quedan al final.
             1 if item["deactivated"] else 0,
@@ -853,11 +860,15 @@ def get_pitch_team_settings(conn: sqlite3.Connection, pitch_id: int) -> dict[int
     cache_key = ("pitch_settings", pitch_id)
     if cache_key not in cache:
         rows = conn.execute(
-            "SELECT team_id, sort_order, deactivated FROM pitch_team_settings WHERE pitch_id = ?",
+            "SELECT team_id, sort_order, deactivated, manual_position FROM pitch_team_settings WHERE pitch_id = ?",
             (pitch_id,),
         ).fetchall()
         cache[cache_key] = {
-            row["team_id"]: {"sort_order": row["sort_order"], "deactivated": bool(row["deactivated"])}
+            row["team_id"]: {
+                "sort_order": row["sort_order"],
+                "deactivated": bool(row["deactivated"]),
+                "manual_position": row["manual_position"],
+            }
             for row in rows
         }
     return cache[cache_key]
@@ -1841,9 +1852,6 @@ class InnovatePitchHandler(SimpleHTTPRequestHandler):
         if user is None:
             return
         pitch_id = parse_pitch_id(parse_qs(parsed.query))
-        if pitch_id != PITCH_ONE:
-            send_error_json(self, HTTPStatus.FORBIDDEN, "La deliberación solo está disponible para el Pitch 1.")
-            return
         try:
             payload = load_json(self)
         except Exception:
@@ -1859,14 +1867,27 @@ class InnovatePitchHandler(SimpleHTTPRequestHandler):
             send_error_json(self, HTTPStatus.BAD_REQUEST, "El orden de equipos es inválido.")
             return
         with db_connect() as conn:
-            existing_ids = {row["id"] for row in conn.execute("SELECT id FROM teams").fetchall()}
+            if pitch_id == PITCH_ONE:
+                existing_ids = {row["id"] for row in conn.execute("SELECT id FROM teams").fetchall()}
+            else:
+                existing_ids = get_pitch_team_ids(conn, pitch_id) or set()
             if set(order_ids) != existing_ids or len(order_ids) != len(existing_ids):
                 send_error_json(self, HTTPStatus.BAD_REQUEST, "El orden debe incluir cada equipo exactamente una vez.")
                 return
-            for position, team_id in enumerate(order_ids, start=1):
-                conn.execute("UPDATE teams SET manual_position = ? WHERE id = ?", (position, team_id))
+            if pitch_id == PITCH_ONE:
+                for position, team_id in enumerate(order_ids, start=1):
+                    conn.execute("UPDATE teams SET manual_position = ? WHERE id = ?", (position, team_id))
+            else:
+                # Solo escribe la posición deliberada de este Pitch; no toca
+                # calificaciones, el orden de presentación ni el Pitch 1.
+                conn.execute(
+                    "INSERT INTO pitch_team_settings (pitch_id, team_id, manual_position) "
+                    "SELECT ?, t.team_id, t.position FROM unnest(?::bigint[], ?::integer[]) AS t(team_id, position) "
+                    "ON CONFLICT (pitch_id, team_id) DO UPDATE SET manual_position = EXCLUDED.manual_position",
+                    (pitch_id, order_ids, list(range(1, len(order_ids) + 1))),
+                )
             conn.commit()
-            dashboard = get_admin_dashboard(conn)
+            dashboard = get_admin_dashboard(conn, None, pitch_id)
         send_json(self, {"ok": True, "message": "Deliberación guardada. El ranking quedó fijado en el orden elegido.", "dashboard": dashboard})
 
     def handle_jury_dashboard(self, parsed) -> None:

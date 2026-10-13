@@ -154,7 +154,7 @@ async function api(path, options = {}) {
 }
 
 function startDeliberation() {
-  if (state.adminPitch !== 1) return;
+  if (![1, 2].includes(state.adminPitch)) return;
   const ranking = state.dashboard?.ranking || [];
   if (!ranking.length) return;
   state.confirmingDeliberation = true;
@@ -198,7 +198,7 @@ async function saveDeliberation() {
   state.deliberationSaving = true;
   render();
   try {
-    const response = await api('/api/admin/ranking', {
+    const response = await api(`/api/admin/ranking?pitch=${state.adminPitch || 1}`, {
       method: 'PUT',
       body: JSON.stringify({ order: state.deliberationOrder }),
     });
@@ -738,7 +738,7 @@ function renderAdminDashboard() {
         <span class="badge">Se recalcula tras cada evaluación</span>
         <div style="display:flex; gap:8px; flex-wrap:wrap; justify-content:flex-end;">
           <button class="button button--ghost" type="button" data-action="export-winners">Exportar ganadores (Excel)</button>
-          ${state.adminPitch === 1 ? '<button class="button button--secondary" type="button" data-action="start-deliberation">Deliberar</button>' : ''}
+          ${[1, 2].includes(state.adminPitch) ? '<button class="button button--secondary" type="button" data-action="start-deliberation">Deliberar</button>' : ''}
         </div>
       `;
 
